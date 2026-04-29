@@ -10,7 +10,11 @@ from pydantic import BaseModel
 
 from .config import settings
 from .harness import IngestionManifest, IngestionNode, IngestionState
-from .pipeline_stages import stage_3_4_submit_to_ragscallion
+from .pipeline_stages import (
+    stage_3_4_submit_to_ragscallion,
+    stage_5_extract_specs,
+    process_stage_5_batch,
+)
 from .ragscallion_client import RagscallionClient
 
 logger = logging.getLogger(__name__)
@@ -169,15 +173,34 @@ class DeviceIngestionPipeline:
         return {"manifest": self.manifest, "execution_state": state.execution_state}
 
     def _stage_extract_specs(self, state: PipelineState) -> dict[str, Any]:
-        """Stage 5: Extract signal specs via Haiku agent + RAG search."""
+        """Stage 5: Extract signal specs via Haiku agent + RAG search.
+
+        Uses asyncio.Semaphore(5) to limit concurrent Haiku calls. Processes the
+        current device via the async stage_5_extract_specs function.
+
+        Note: This single-device wrapper maintains compatibility with the
+        sequential pipeline. For batch processing of queue_3, use process_stage_5_batch.
+        """
         device_id = state.execution_state.current_device_id
         node = self.manifest.get_node(device_id)
 
         logger.info(f"[Stage 5] Extracting specs for {device_id}")
-        # TODO: Implement Haiku agent with RAG queries
 
-        self.manifest.add_node(node)
-        state.execution_state.advance_stage()
+        # Run async extraction synchronously
+        success = asyncio.run(
+            stage_5_extract_specs(
+                node,
+                self.ragscallion_client,
+                self.manifest,
+            )
+        )
+
+        if success:
+            # Advance stage on success
+            state.execution_state.advance_stage()
+        else:
+            # On failure, device goes to queue_4 for manual review
+            logger.warning(f"Device {device_id} extraction failed, moved to manual review queue")
 
         return {"manifest": self.manifest, "execution_state": state.execution_state}
 

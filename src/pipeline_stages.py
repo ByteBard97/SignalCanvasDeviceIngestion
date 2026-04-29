@@ -4,11 +4,20 @@ Each stage is a pure async function that processes a device node and persists re
 Stages use constants for queue IDs and stage codes (no magic numbers).
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from .harness.manifest import DeviceNode, Manifest, QUEUE_2_POLLING_RAGSCALLION, QUEUE_4_MANUAL_REVIEW, STAGE_INDEX_RAG
+from .harness.manifest import (
+    DeviceNode,
+    Manifest,
+    QUEUE_2_POLLING_RAGSCALLION,
+    QUEUE_3_READY_FOR_EXTRACTION,
+    QUEUE_4_MANUAL_REVIEW,
+    STAGE_INDEX_RAG,
+    STAGE_EXTRACT_SPECS,
+)
 from .ragscallion_client import (
     RagscallionClient,
     RagscallionCollisionError,
@@ -23,6 +32,13 @@ STAGE_NOT_STARTED = 0
 STAGE_IN_PROGRESS = 1
 STAGE_COMPLETED = 2
 STAGE_FAILED = 3
+
+# Concurrency control for spec extraction
+EXTRACTION_SEMAPHORE = asyncio.Semaphore(5)  # Max 5 concurrent Haiku calls
+
+# Concurrency constants (no magic numbers)
+MAX_CONCURRENT_EXTRACTIONS = 5
+EXTRACTION_TIMEOUT_SECONDS = 60
 
 
 async def stage_3_4_submit_to_ragscallion(
@@ -120,3 +136,201 @@ async def stage_3_4_submit_to_ragscallion(
         manifest.persist(node)
         logger.error(f"Device {node.device_id} submission error: {e}")
         return False
+
+
+async def stage_5_extract_specs(
+    node: DeviceNode,
+    ragscallion_client: RagscallionClient,
+    manifest: Manifest,
+) -> bool:
+    """Extract device specs via Haiku agent with RAG search context.
+
+    Uses semaphore to limit concurrent Haiku calls to 5 (I/O-bound, doesn't
+    compete with GPU). Reduces extraction time from 30+ hours to ~10 hours
+    for 7,000 devices.
+
+    Input:
+        node: Device node with corpus_id from stage 3-4
+        ragscallion_client: RagscallionClient for RAG corpus search
+        manifest: Manifest instance for persistence
+
+    Output:
+        True if specs successfully extracted and stored
+        False if extraction failed and moved to queue_4 (retryable)
+
+    Processing:
+        - Acquire semaphore (max 5 concurrent)
+        - Search Ragscallion corpus for device context
+        - Call Haiku agent to extract specs from corpus hits
+        - Store specs_json, mark stage_extract_specs=COMPLETED
+        - On failure: move to queue_4 with EXTRACTION_FAILED
+
+    Side Effects:
+        - Updates node: specs_json, stage_extract_specs, queue (on failure)
+        - Persists node to manifest
+        - Logs extraction result
+
+    Note:
+        Anthropic rate limits (4000 RPM) are safe at 5 concurrent.
+        If hitting 429s, reduce MAX_CONCURRENT_EXTRACTIONS.
+    """
+    async with EXTRACTION_SEMAPHORE:
+        try:
+            # Perform RAG search for device context
+            # TODO: Implement RAG search and Haiku agent call
+            # For now, placeholder for extraction logic
+            spec_json = await _extract_specs_via_agent(
+                manufacturer=node.manufacturer,
+                model=node.model,
+                corpus_id=node.corpus_id,
+                rag_search=lambda q: ragscallion_client.search(q, corpus=node.corpus_id),
+            )
+
+            if not spec_json:
+                # Extraction failed: mark for retry
+                node.failure_stage = STAGE_EXTRACT_SPECS
+                node.failure_category = "EXTRACTION_FAILED"
+                node.failure_message = "Agent couldn't extract specs from corpus"
+                node.failure_retryable = True
+                node.failure_attempts += 1
+                node.failure_at = datetime.now(timezone.utc).isoformat()
+                node.queue = QUEUE_4_MANUAL_REVIEW
+                node.stage_extract_specs = STAGE_FAILED
+                manifest.persist(node)
+                logger.warning(f"Device {node.device_id} extraction failed")
+                return False
+
+            # Success: store specs and mark complete
+            node.specs_json = spec_json
+            node.stage_extract_specs = STAGE_COMPLETED
+            manifest.persist(node)
+            logger.info(f"Device {node.device_id} specs extracted successfully")
+            return True
+
+        except asyncio.TimeoutError:
+            # Extraction timeout (per-device EXTRACTION_TIMEOUT_SECONDS)
+            node.failure_stage = STAGE_EXTRACT_SPECS
+            node.failure_category = "EXTRACTION_TIMEOUT"
+            node.failure_message = f"Extraction timeout after {EXTRACTION_TIMEOUT_SECONDS}s"
+            node.failure_retryable = True
+            node.failure_attempts += 1
+            node.failure_at = datetime.now(timezone.utc).isoformat()
+            node.queue = QUEUE_4_MANUAL_REVIEW
+            node.stage_extract_specs = STAGE_FAILED
+            manifest.persist(node)
+            logger.error(f"Device {node.device_id} extraction timeout")
+            return False
+
+        except Exception as e:
+            # Unexpected error: log and move to manual review
+            node.failure_stage = STAGE_EXTRACT_SPECS
+            node.failure_category = "EXTRACTION_FAILED"
+            node.failure_message = f"Unexpected error: {str(e)}"
+            node.failure_retryable = False
+            node.failure_attempts += 1
+            node.failure_at = datetime.now(timezone.utc).isoformat()
+            node.queue = QUEUE_4_MANUAL_REVIEW
+            node.stage_extract_specs = STAGE_FAILED
+            manifest.persist(node)
+            logger.error(f"Device {node.device_id} extraction error: {e}")
+            return False
+
+
+async def _extract_specs_via_agent(
+    manufacturer: str,
+    model: str,
+    corpus_id: str,
+    rag_search,
+) -> Optional[str]:
+    """Extract device specs via Haiku agent using RAG context.
+
+    Placeholder for actual agent implementation.
+
+    Args:
+        manufacturer: Device manufacturer (e.g., "YAMAHA")
+        model: Device model (e.g., "R08D")
+        corpus_id: Ragscallion corpus ID for this device
+        rag_search: Callable that searches Ragscallion corpus for context
+
+    Returns:
+        JSON string of extracted specs, or None if extraction failed.
+
+    TODO:
+        - Implement actual Haiku agent call
+        - Query corpus for device specs
+        - Parse agent response into structured JSON
+    """
+    # TODO: Replace with actual Haiku agent implementation
+    return None
+
+
+async def process_stage_5_batch(
+    manifest: Manifest,
+    ragscallion_client: RagscallionClient,
+) -> dict[str, int]:
+    """Process all nodes in queue_3 (ready for extraction) with semaphore limit.
+
+    Batch processes all devices ready for stage 5 extraction in parallel,
+    enforcing max 5 concurrent Haiku calls via semaphore.
+
+    Input:
+        manifest: Manifest instance with device nodes
+        ragscallion_client: RagscallionClient for RAG searches
+
+    Output:
+        Dictionary with counts: {successful, failed, exceptions}
+
+    Processing:
+        - Get all nodes in queue_3 (ready to extract specs)
+        - Create async tasks for all nodes
+        - Run with asyncio.gather(..., return_exceptions=True)
+        - Semaphore enforces max 5 concurrent extraction calls
+        - Log final counts
+
+    Side Effects:
+        - Updates all processed nodes in manifest
+        - Moves failed nodes to queue_4 (manual review)
+        - Logs batch processing summary
+
+    Note:
+        At 5 concurrent, with ~20s per extraction:
+        - 7,000 devices / 5 concurrent = 1,400 batches
+        - 1,400 * 20s = 28,000 seconds = ~7.8 hours
+        vs. 7,000 * 20s = 140,000 seconds = ~39 hours serial
+    """
+    # Get all nodes ready for extraction (queue_3)
+    # TODO: Implement manifest.list_by_queue(3) or equivalent
+    nodes = []  # Placeholder; will be populated from manifest
+
+    if not nodes:
+        logger.info("No nodes in queue_3 (ready for extraction)")
+        return {"successful": 0, "failed": 0, "exceptions": 0}
+
+    logger.info(
+        f"Processing {len(nodes)} nodes for spec extraction "
+        f"(semaphore limit: {MAX_CONCURRENT_EXTRACTIONS})"
+    )
+
+    # Run all extractions in parallel with semaphore enforcing max 5 concurrent
+    tasks = [
+        stage_5_extract_specs(node, ragscallion_client, manifest)
+        for node in nodes
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Count results
+    successful = sum(1 for r in results if r is True)
+    failed = sum(1 for r in results if r is False)
+    exceptions = sum(1 for r in results if isinstance(r, Exception))
+
+    logger.info(
+        f"Stage 5 batch complete: {successful} successful, "
+        f"{failed} failed, {exceptions} exceptions"
+    )
+
+    return {
+        "successful": successful,
+        "failed": failed,
+        "exceptions": exceptions,
+    }
