@@ -12,6 +12,7 @@ from typing import Optional
 from .harness.manifest import (
     DeviceNode,
     Manifest,
+    FailureCategory,
     QUEUE_2_POLLING_RAGSCALLION,
     QUEUE_3_READY_FOR_EXTRACTION,
     QUEUE_4_MANUAL_REVIEW,
@@ -98,7 +99,7 @@ async def stage_3_4_submit_to_ragscallion(
     except RagscallionCollisionError as e:
         # source_label already exists in corpus → manual review required
         node.failure_stage = STAGE_INDEX_RAG
-        node.failure_category = "RAGDB_COLLISION"
+        node.failure_category = FailureCategory.RAGDB_COLLISION.value
         node.failure_message = f"source_label '{source_label}' already in corpus '{corpus_id}'"
         node.failure_retryable = False
         node.failure_attempts += 1
@@ -112,7 +113,7 @@ async def stage_3_4_submit_to_ragscallion(
     except RagscallionUnavailableError as e:
         # Ragscallion unavailable after 3 retries
         node.failure_stage = STAGE_INDEX_RAG
-        node.failure_category = "RAGSCALLION_UNAVAILABLE"
+        node.failure_category = FailureCategory.RAGSCALLION_UNAVAILABLE.value
         node.failure_message = f"Failed to submit after 3 retries: {e}"
         node.failure_retryable = True
         node.failure_attempts += 1
@@ -126,7 +127,7 @@ async def stage_3_4_submit_to_ragscallion(
     except RagscallionError as e:
         # Other Ragscallion errors (validation, etc.)
         node.failure_stage = STAGE_INDEX_RAG
-        node.failure_category = "RAGDB_SUBMISSION_ERROR"
+        node.failure_category = FailureCategory.RAGDB_SUBMISSION_ERROR.value
         node.failure_message = str(e)
         node.failure_retryable = False
         node.failure_attempts += 1
@@ -189,7 +190,7 @@ async def stage_5_extract_specs(
             if not spec_json:
                 # Extraction failed: mark for retry
                 node.failure_stage = STAGE_EXTRACT_SPECS
-                node.failure_category = "EXTRACTION_FAILED"
+                node.failure_category = FailureCategory.EXTRACTION_FAILED.value
                 node.failure_message = "Agent couldn't extract specs from corpus"
                 node.failure_retryable = True
                 node.failure_attempts += 1
@@ -210,7 +211,7 @@ async def stage_5_extract_specs(
         except asyncio.TimeoutError:
             # Extraction timeout (per-device EXTRACTION_TIMEOUT_SECONDS)
             node.failure_stage = STAGE_EXTRACT_SPECS
-            node.failure_category = "EXTRACTION_TIMEOUT"
+            node.failure_category = FailureCategory.EXTRACTION_TIMEOUT.value
             node.failure_message = f"Extraction timeout after {EXTRACTION_TIMEOUT_SECONDS}s"
             node.failure_retryable = True
             node.failure_attempts += 1
@@ -224,7 +225,7 @@ async def stage_5_extract_specs(
         except Exception as e:
             # Unexpected error: log and move to manual review
             node.failure_stage = STAGE_EXTRACT_SPECS
-            node.failure_category = "EXTRACTION_FAILED"
+            node.failure_category = FailureCategory.EXTRACTION_FAILED.value
             node.failure_message = f"Unexpected error: {str(e)}"
             node.failure_retryable = False
             node.failure_attempts += 1

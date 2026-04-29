@@ -22,17 +22,32 @@ class StageStatus(str, Enum):
 
 class FailureCategory(str, Enum):
     """Categorized failure reasons for analysis and retry."""
-    PDF_NOT_FOUND = "PDF_NOT_FOUND"
-    PDF_DOWNLOAD_FAILED = "PDF_DOWNLOAD_FAILED"
-    PDF_INVALID = "PDF_INVALID"
-    MARKER_FAILED = "MARKER_FAILED"
-    MARKER_TIMEOUT = "MARKER_TIMEOUT"
-    RAGDB_INDEXING_FAILED = "RAGDB_INDEXING_FAILED"
-    EXTRACTION_FAILED = "EXTRACTION_FAILED"
-    EXTRACTION_TIMEOUT = "EXTRACTION_TIMEOUT"
-    PATCH_GENERATION_FAILED = "PATCH_GENERATION_FAILED"
-    PATCH_VALIDATION_FAILED = "PATCH_VALIDATION_FAILED"
-    UNKNOWN = "UNKNOWN"
+    # Stage 1-2 failures (PDF acquisition)
+    PDF_NOT_FOUND = "PDF_NOT_FOUND"                 # retryable: yes (user can provide URL)
+    PDF_DOWNLOAD_FAILED = "PDF_DOWNLOAD_FAILED"     # retryable: yes (retry download)
+    PDF_INVALID = "PDF_INVALID"                     # retryable: no (file corrupt)
+
+    # Stage 3 failure (PDF conversion)
+    MARKER_FAILED = "MARKER_FAILED"                 # retryable: yes (Marker bug)
+    MARKER_TIMEOUT = "MARKER_TIMEOUT"               # retryable: yes (longer timeout)
+
+    # Stage 3-4 failures (Ragscallion submission)
+    RAGDB_COLLISION = "RAGDB_COLLISION"             # retryable: no (human decides)
+    RAGSCALLION_UNAVAILABLE = "RAGSCALLION_UNAVAILABLE"  # retryable: yes (server down)
+    RAGDB_SUBMISSION_ERROR = "RAGDB_SUBMISSION_ERROR"    # retryable: no (validation error)
+    RAGDB_INDEXING_FAILED = "RAGDB_INDEXING_FAILED"      # retryable: no (indexing logic)
+
+    # Stage 5 failure (extraction)
+    EXTRACTION_FAILED = "EXTRACTION_FAILED"         # retryable: yes (refine prompt)
+    EXTRACTION_TIMEOUT = "EXTRACTION_TIMEOUT"       # retryable: yes (longer timeout)
+
+    # Stage 6 failure (generation)
+    PATCH_GENERATION_FAILED = "PATCH_GENERATION_FAILED"  # retryable: yes (different params)
+
+    # Stage 7 failure (validation)
+    PATCH_VALIDATION_FAILED = "PATCH_VALIDATION_FAILED"  # retryable: no (fix generation)
+
+    UNKNOWN = "UNKNOWN"                             # retryable: unknown
 
 
 # Stage numbering constants (no magic numbers per ClaudeCodeRules)
