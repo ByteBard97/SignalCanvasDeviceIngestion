@@ -119,10 +119,19 @@
 - Failure categorization and iteration loop
 
 ### R10: Phased Execution
+- **Phase 0**: Harness validation on 1-3 known devices → verify pipeline works
 - **Phase 1**: Test harness on 50 known devices → refine process
 - **Phase 2**: 1,500 mid-tier devices → apply Phase 1 learnings
 - **Phase 3**: Remaining devices → accept lower hit rate
 - **Goal**: Complete in 1 week (overnight/evening runs)
+
+### R11: QA Pipeline (Sampling + Validation)
+- After initial generation, sample N generated `.patch` files randomly
+- Query RAG DB for each sample with device name + extracted specs
+- Compare: Does RAG manual content match generated specs?
+- Flag discrepancies for manual review
+- **Goal**: Validate accuracy before merging to stdlib
+- **Note**: Design/implementation deferred until initial import works
 
 ---
 

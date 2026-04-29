@@ -808,6 +808,107 @@ class Config:
 
 ---
 
+## QA Pipeline (Sampling + Validation)
+
+**New pipeline after initial generation:**
+
+Once generated `.patch` files are in `output/stdlib/devices/`, a QA pipeline runs:
+
+1. **Random sampling** — Agent randomly samples N generated `.patch` files
+2. **RAG query** — For each sampled device, query RAG DB with device name + key specs
+3. **Comparison** — Check if generated specs match what the manual says
+4. **Report** — Flag discrepancies for manual review
+
+This ensures generated templates are accurate before merging to SignalCanvasFrontend stdlib.
+
+**Implementation TBD** — placeholder in architecture, will design after initial import works.
+
+---
+
+## Reusable Code Found in Codebase
+
+### 1. Device Import Scripts
+
+**EasySchematic Importer** (`tools/library/import-easyschematic-devices.ts`)
+- Signal type mapping (50+ types: Dante, AES67, SDI, HDMI, etc.)
+- Connector type normalization (XLR-3 → XLR, etc.)
+- Direction logic (ring protocols always `io`)
+- Port grouping/range collapsing
+- **Reuse:** Copy signal/connector mapping tables, port direction logic
+
+**Patchify JSON Converter** (`scripts/convert-patchify-to-patchlang.ts`)
+- Patchify JSON → .patch format conversion
+- Signal filtering (skip power, USB, GPIO, etc.)
+- Device deduplication by manufacturer+model
+- Category-based file organization
+- **Reuse:** Adapt for PDF→spec extraction pipeline
+
+**JSON Library Extractor** (`tools/library/extract-library-from-json.ts`)
+- Deduplication logic
+- Output organization
+- **Reuse:** Reference for dedup strategy
+
+### 2. Library Loading Pipeline
+
+**Library Resolver** (`src/lang/libraryResolver.ts`, 173 lines)
+- Priority-based template lookup
+- Namespace support
+- Clean, testable API
+- **Reuse:** Can reuse directly for testing generated templates
+
+**Library Loader** (`src/utils/libraryLoader.ts`, 130 lines)
+- Parse .patch files → metadata
+- Index by domain/protocol/connector
+- **Reuse:** Study for loading our generated files
+
+**Device Builder** (`src/utils/patchlangDeviceBuilder.ts`)
+- TemplateDecl → UserDevice mapping
+- Port range collapsing
+- **Reuse:** Reference for template validation
+
+**Library Emitter** (`src/lang/libraryEmitter.ts`, 91 lines)
+- Inverse of loader: UserDevice[] → .patch format
+- Clean generation logic
+- **Reuse:** Study for template formatting
+
+### 3. Existing RAG Infrastructure
+
+**Device Library RAG Server** (at `your-username@localhost:~/projects/device-library-rag`)
+- Already running on port 8086
+- Indexed with device manuals (PDFs → Markdown → Vector DB)
+- Query script: `SignalCanvasLang/scripts/rag-device-query.sh`
+
+**API Endpoints:**
+```bash
+# Search for device specs
+curl "http://192.168.0.200:8086/search?q=yamaha+cl5+ports&n=5&mode=hybrid&source=yamaha-cl5"
+
+# List indexed sources
+curl "http://192.168.0.200:8086/sources"
+
+# Get index stats
+curl "http://192.168.0.200:8086/stats"
+```
+
+**Usage in our pipeline:**
+- No need to build RAG from scratch
+- Use existing server for agent extraction queries
+- Stage 4 (Index RAG) can ingest new manuals into existing server
+
+### 4. Test Fixtures & Example Data
+
+**Ground Truth Devices (Reid's work):**
+- `Reids_Devices.patch` — Professional venue setup
+- `hillsong-merged.patch` — Large real-world project
+- `broadcast-truck.patch` — Broadcast example
+- Device libraries: 200+ templates in `/src/data/stdlib/` and `/src/examples/devices/`
+
+**Test Cases:**
+- `/src/examples/test-battery/` — 8 structured feature tests
+- `/src/lang/__tests__/fixtures/baseline-emit/` — Expected output validation
+
+---
+
 ## Output
 
 ### 1. Valid `.patch` Files
