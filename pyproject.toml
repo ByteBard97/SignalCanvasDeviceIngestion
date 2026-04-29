@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signal-canvas-device-ingestion"
+version = "0.1.0"
+description = "Automated pipeline to convert AV device manufacturer manuals into SignalCanvas device templates"
+authors = [
+    {name = "ByteBard97", email = "ByteBard97"},
+]
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+dependencies = [
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "click>=8.0.0",
+    "requests>=2.31.0",
+    "langgraph>=0.0.1",
+    "langchain>=0.1.0",
+    "sentence-transformers>=2.2.0",
+    "lancedb>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+marker = [
+    "marker-ai>=0.2.0",
+]
+
+compiler = [
+    "patchlang-python>=0.2.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+asyncio_mode = "auto"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "W"]
+ignore = ["E501"]  # Line too long (Black handles this)
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
