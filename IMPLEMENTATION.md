@@ -213,63 +213,272 @@ class IngestionManifest:
         ...
 ```
 
-### 2. Pipeline Orchestration (src/pipeline.py)
+### 2. Pipeline Orchestration with LangGraph (src/graph/graph.py)
+
+Uses LangGraph (like vuemorphic) for robust agentic lifecycle and resumable execution.
 
 ```python
-class DeviceIngestionPipeline:
-    """Main orchestrator."""
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+class IngestionState(TypedDict):
+    """LangGraph state for device ingestion pipeline."""
     
-    def __init__(self, config: Config):
-        self.manifest = IngestionManifest(config.manifest_db)
-        self.stages = {
-            1: FindPDFStage(self.manifest),
-            2: DownloadPDFStage(self.manifest),
-            3: ConvertMarkerStage(self.manifest),
-            4: IndexRAGStage(self.manifest),
-            5: ExtractSpecsStage(self.manifest),
-            6: GeneratePatchStage(self.manifest),
-            7: ValidatePatchStage(self.manifest),
-        }
+    # Current device
+    current_device_id: Optional[str]
+    current_node: Optional[IngestionNode]
+    current_stage: int  # 1-7
     
-    def run_phase(self, phase: int, max_devices: int = 500):
-        """
-        Run one phase:
-        - Phase 1: Known devices (50)
-        - Phase 2: Mid-tier (1,500)
-        - Phase 3: Remaining (remaining)
-        """
-        devices = self.manifest.load_phase(phase)
-        
-        for stage_num in range(1, 8):
-            stage = self.stages[stage_num]
-            ready = self.manifest.next_nodes_for_stage(stage_num, max_devices)
-            
-            logger.info(f"Phase {phase}: Stage {stage_num}: {len(ready)} devices")
-            
-            for node in ready:
-                try:
-                    result = stage.process(node)
-                    node.status = IngestionStatus.DONE if stage_num == 7 else ...
-                    self.manifest.update_node(node)
-                except StageFailure as e:
-                    node.last_error = str(e)
-                    node.failure_category = e.category
-                    node.retry_count += 1
-                    self.manifest.update_node(node)
-                    logger.error(f"Device {node.device_id} failed at stage {stage_num}: {e}")
+    # Phase tracking
+    phase: int  # 1, 2, or 3
+    phase_devices: List[str]
     
-    def generate_report(self) -> dict:
-        """Summary statistics."""
-        return {
-            "total_devices": len(self.manifest.all_nodes()),
-            "completed": len(self.manifest.nodes_by_status(IngestionStatus.DONE)),
-            "failed": len(self.manifest.nodes_by_status(IngestionStatus.FAILED)),
-            "by_failure_category": {
-                cat: len(self.manifest.nodes_by_failure_category(cat))
-                for cat in FailureCategory
-            },
-        }
+    # Attempt/failure tracking
+    attempt_count: int
+    last_error: Optional[str]
+    failure_category: Optional[FailureCategory]
+    
+    # Pipeline state
+    done: bool
+    interrupt_payload: Optional[dict]  # For manual intervention
+    
+    # Manifest reference
+    manifest_db: str
+
+def build_ingestion_graph(checkpointer=None):
+    """Build LangGraph state graph for device ingestion."""
+    
+    graph = StateGraph(IngestionState)
+    
+    # Nodes (stages + utilities)
+    graph.add_node("pick_next_device", pick_next_device)
+    graph.add_node("find_pdf", stage_find_pdf)
+    graph.add_node("download_pdf", stage_download_pdf)
+    graph.add_node("convert_marker", stage_convert_marker)
+    graph.add_node("index_rag", stage_index_rag)
+    graph.add_node("extract_specs", stage_extract_specs)
+    graph.add_node("generate_patch", stage_generate_patch)
+    graph.add_node("validate_patch", stage_validate_patch)
+    graph.add_node("update_manifest", update_manifest)
+    graph.add_node("categorize_failure", categorize_failure)
+    graph.add_node("queue_manual_review", queue_manual_review)
+    
+    # Entry point
+    graph.set_entry_point("pick_next_device")
+    
+    # Edges: pick device → start pipeline
+    def route_after_pick(state: IngestionState) -> str:
+        if state.get("done"):
+            return "update_manifest"  → END
+        return "find_pdf"
+    
+    graph.add_conditional_edges(
+        "pick_next_device",
+        route_after_pick,
+        {"find_pdf": "find_pdf", "update_manifest": "update_manifest"},
+    )
+    
+    # Linear pipeline stages
+    graph.add_edge("find_pdf", "download_pdf")
+    graph.add_edge("download_pdf", "convert_marker")
+    graph.add_edge("convert_marker", "index_rag")
+    graph.add_edge("index_rag", "extract_specs")
+    graph.add_edge("extract_specs", "generate_patch")
+    graph.add_edge("generate_patch", "validate_patch")
+    
+    # After validation, route to success or failure handling
+    def route_after_validation(state: IngestionState) -> str:
+        if state.get("current_node", {}).get("validation_result", {}).get("valid"):
+            return "update_manifest"  # Success
+        return "categorize_failure"
+    
+    graph.add_conditional_edges(
+        "validate_patch",
+        route_after_validation,
+        {
+            "update_manifest": "update_manifest",
+            "categorize_failure": "categorize_failure",
+        },
+    )
+    
+    # Failure handling
+    def route_after_failure(state: IngestionState) -> str:
+        category = state.get("failure_category")
+        if category in ["patch_invalid", "extraction_failed"]:
+            return "queue_manual_review"
+        # Otherwise, log and continue to next device
+        return "update_manifest"
+    
+    graph.add_conditional_edges(
+        "categorize_failure",
+        route_after_failure,
+        {
+            "update_manifest": "update_manifest",
+            "queue_manual_review": "queue_manual_review",
+        },
+    )
+    
+    # Back to start
+    graph.add_edge("update_manifest", "pick_next_device")
+    graph.add_edge("queue_manual_review", "pick_next_device")
+    
+    # Compile with optional checkpointer (for resumable execution)
+    return graph.compile(checkpointer=checkpointer)
+
+def build_checkpointed_graph(checkpoint_db: str):
+    """Build graph with SqliteSaver for resumable execution."""
+    import sqlite3
+    conn = sqlite3.connect(checkpoint_db, check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
+    return build_ingestion_graph(checkpointer=checkpointer)
+
+# Direct graph for CLI usage (no checkpoint)
+ingestion_graph = build_ingestion_graph()
 ```
+
+### Node Implementations
+
+Each stage is a node function:
+
+```python
+def pick_next_device(state: IngestionState) -> IngestionState:
+    """Load next device from manifest, route through pipeline."""
+    manifest = load_manifest(state["manifest_db"])
+    
+    # Pick next device at current stage
+    next_node = manifest.next_node_for_stage(state["current_stage"])
+    
+    if not next_node:
+        state["done"] = True
+        return state
+    
+    state["current_device_id"] = next_node.device_id
+    state["current_node"] = next_node
+    state["attempt_count"] = 0
+    return state
+
+def stage_find_pdf(state: IngestionState) -> IngestionState:
+    """Stage 1: Find PDF via web search + validation."""
+    node = state["current_node"]
+    
+    try:
+        finder = FindPDFAgent()
+        pdf_url = finder.find(node.device_input)
+        
+        node.pdf_url = pdf_url
+        state["current_stage"] = 2
+        return state
+    except StageFailure as e:
+        state["failure_category"] = e.category
+        state["last_error"] = str(e)
+        return state
+
+def stage_download_pdf(state: IngestionState) -> IngestionState:
+    """Stage 2: Download PDF."""
+    node = state["current_node"]
+    
+    try:
+        pdf_data = download_file(node.pdf_url, timeout=30)
+        pdf_path = save_pdf(node.device_id, pdf_data)
+        
+        node.pdf_path = pdf_path
+        state["current_stage"] = 3
+        return state
+    except StageFailure as e:
+        state["failure_category"] = e.category
+        state["last_error"] = str(e)
+        return state
+
+# ... continue for each stage (convert_marker, index_rag, extract_specs, generate_patch, validate_patch)
+
+def categorize_failure(state: IngestionState) -> IngestionState:
+    """Categorize failure and decide if it's retryable."""
+    error = state["last_error"]
+    
+    # Use Haiku to classify (or heuristics)
+    if "not found" in error.lower():
+        state["failure_category"] = FailureCategory.PDF_NOT_FOUND
+    elif "timeout" in error.lower() or "connection" in error.lower():
+        state["failure_category"] = FailureCategory.DOWNLOAD_FAILED
+    elif "marker" in error.lower() or "pdf" in error.lower():
+        state["failure_category"] = FailureCategory.MARKER_FAILED
+    else:
+        state["failure_category"] = FailureCategory.UNKNOWN
+    
+    return state
+
+def update_manifest(state: IngestionState) -> IngestionState:
+    """Persist updated node to manifest."""
+    manifest = load_manifest(state["manifest_db"])
+    manifest.update_node(state["current_node"])
+    return state
+
+def queue_manual_review(state: IngestionState) -> IngestionState:
+    """Flag device for manual review."""
+    manifest = load_manifest(state["manifest_db"])
+    node = state["current_node"]
+    node.status = IngestionStatus.MANUAL_REVIEW
+    manifest.update_node(node)
+    return state
+```
+
+### Usage (CLI and Programmatic)
+
+```python
+# CLI: Run phase 1
+def run_phase(phase: int, max_devices: int):
+    """Run a phase using the LangGraph pipeline."""
+    manifest = IngestionManifest(config.manifest_db)
+    devices = manifest.load_phase(phase, max_devices)
+    
+    graph = ingestion_graph
+    
+    for device in devices:
+        state = {
+            "current_device_id": device.device_id,
+            "current_node": device,
+            "current_stage": 1,
+            "phase": phase,
+            "attempt_count": 0,
+            "done": False,
+            "manifest_db": config.manifest_db,
+        }
+        
+        # Run until device completes or fails
+        while not state.get("done"):
+            state = graph.invoke(state)
+
+# Server-mode: resumable execution via checkpoints
+def serve_with_resume():
+    """Start server with resumable pipeline."""
+    from flask import Flask
+    app = Flask(__name__)
+    
+    graph = build_checkpointed_graph(config.checkpoint_db)
+    
+    @app.route("/run/<phase>", methods=["POST"])
+    def run_phase_api(phase):
+        """Run a phase, resumable."""
+        manifest = IngestionManifest(config.manifest_db)
+        devices = manifest.load_phase(int(phase), 500)
+        
+        for device in devices:
+            state = {...}
+            # Graph checkpoints automatically
+            output = graph.invoke(state, config={"configurable": {"thread_id": device.device_id}})
+        
+        return {"status": "done", "report": manifest.summary()}
+    
+    app.run()
+```
+
+**Benefits of LangGraph approach:**
+
+1. **Resumable execution**: Checkpointer saves state after each node, can resume from failure
+2. **Explicit state management**: Clear state dict, easy to debug
+3. **Conditional routing**: Natural way to handle success/failure branching
+4. **Observable**: Can visualize graph, trace execution paths
+5. **Proven pattern**: vuemorphic uses this for similar multi-stage pipelines
 
 ### 3. Stage Interface (base class)
 
@@ -660,18 +869,40 @@ Location: `output/validation_report.json`
 
 ### Python
 - `patchlang_python` (from SignalCanvasLang build)
+- `langgraph` (agentic orchestration + checkpointing)
+- `langchain` (agent framework)
 - `sentence-transformers` (RAG embeddings)
-- `sqlite3` (manifest DB)
+- `sqlite3` (manifest DB + LangGraph checkpoints)
 - `pydantic` (data models)
 - `click` (CLI)
+- `requests` (PDF downloads)
 
 ### External
 - **Marker**: PDF → Markdown (pip install marker-ai)
-- **Claude API**: Haiku/Sonnet for agents
+- **Claude API**: Haiku/Sonnet for agents (via Claude Code SDK)
 - **Web search**: Claude Code's built-in WebSearch tool
+
+### Installation
+
+```bash
+# Core
+pip install langgraph langchain pydantic click
+
+# RAG
+pip install sentence-transformers
+
+# PDF conversion
+pip install marker-ai
+
+# PatchLang compiler (from SignalCanvasLang)
+cd ../SignalCanvasLang/crates/patchlang-python
+pip install maturin
+maturin develop
+```
 
 ### No external services required
 - No Chroma, Pinecone, or cloud APIs
 - No database infrastructure
 - Everything runs locally
+- LangGraph checkpoints stored in local SQLite
 
