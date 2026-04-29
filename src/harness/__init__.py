@@ -1,6 +1,41 @@
 """Device ingestion harness - manifest system and state tracking."""
 
-from .manifest import IngestionManifest, IngestionNode
+from .manifest import (
+    DeviceNode,
+    IngestionManifest,
+    IngestionNode,
+    Manifest,
+    StageStatus,
+    FailureCategory,
+    STAGE_FIND_PDF,
+    STAGE_DOWNLOAD_PDF,
+    STAGE_CONVERT_MARKER,
+    STAGE_INDEX_RAG,
+    STAGE_EXTRACT_SPECS,
+    STAGE_GENERATE_PATCH,
+    STAGE_VALIDATE_PATCH,
+    QUEUE_0_INITIAL,
+    QUEUE_1_READY_FOR_PROCESSING,
+    QUEUE_2_POLLING_RAGSCALLION,
+)
 from .state import IngestionState
 
-__all__ = ["IngestionManifest", "IngestionNode", "IngestionState"]
+__all__ = [
+    "DeviceNode",
+    "IngestionManifest",
+    "IngestionNode",
+    "Manifest",
+    "IngestionState",
+    "StageStatus",
+    "FailureCategory",
+    "STAGE_FIND_PDF",
+    "STAGE_DOWNLOAD_PDF",
+    "STAGE_CONVERT_MARKER",
+    "STAGE_INDEX_RAG",
+    "STAGE_EXTRACT_SPECS",
+    "STAGE_GENERATE_PATCH",
+    "STAGE_VALIDATE_PATCH",
+    "QUEUE_0_INITIAL",
+    "QUEUE_1_READY_FOR_PROCESSING",
+    "QUEUE_2_POLLING_RAGSCALLION",
+]
