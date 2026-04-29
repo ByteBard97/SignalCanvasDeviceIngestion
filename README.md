@@ -70,33 +70,75 @@ See `REQUIREMENTS.md` for:
 
 ## Setup
 
-### Dependencies
+### Prerequisites
+
+**Ragscallion RAG microservice must be running.** The pipeline delegates PDF indexing and semantic search to Ragscallion instead of building its own RAG system.
 
 ```bash
-# Python
-pip install pydantic click pydantic-settings
+# Clone and start Ragscallion (runs on 192.168.0.200:8086)
+git clone https://github.com/ByteBard97/ragscallion
+cd ragscallion
+python server.py 8086
 
-# RAG embeddings
-pip install sentence-transformers
+# Verify it's running
+curl http://localhost:8086/health  # Should return "ok"
+```
 
-# PDF conversion (requires system deps)
-pip install marker-ai
+**PatchLang compiler** must be built from the sibling SignalCanvasLang repo:
 
-# PatchLang compiler (build from SignalCanvasLang)
+```bash
 cd ../SignalCanvasLang/crates/patchlang-python
 pip install maturin
 maturin develop
 ```
 
+### Dependencies
+
+```bash
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Or manually:
+pip install pydantic click pydantic-settings requests langgraph langchain sentence-transformers
+```
+
 ### Environment
 
 ```bash
-# .env
-CLAUDE_API_KEY=<your key>
-MANIFESTS_DB=output/ingestion.db
-RAG_DB=output/rag.db
-STDLIB_OUTPUT=output/stdlib/devices
+# Create .env from template
+cp .env.example .env
+
+# Edit .env and set:
+CLAUDE_API_KEY=sk-ant-...
+RAGSCALLION_HOST=192.168.0.200      # Where your Ragscallion server is running
+RAGSCALLION_PORT=8086
+RAGSCALLION_SSH_USER=your-username
+RAGSCALLION_SSH_HOST=192.168.0.200
 ```
+
+### Architecture
+
+```
+Device Input
+    ↓
+[Pipeline Harness] ← SQLite manifest (persistent state)
+    ↓
+Stage 1-4: Find → Download → Convert → Index
+    ↓
+[Ragscallion RAG] ← Indexed device manuals + vector embeddings
+    ↓
+Stage 5-7: Extract specs → Generate patch → Validate
+    ↓
+Valid .patch files → output/stdlib/devices/
+Invalid → output/validation_report.json
+```
+
+**Key dependency:** Ragscallion is responsible for:
+- PDF → Markdown conversion via Marker (GPU-accelerated on Linux box)
+- Vector embedding and semantic search for spec extraction
+- Device manual indexing and retrieval
+
+The pipeline runs on your local machine and delegates these operations to Ragscallion via HTTP + SSH.
 
 ## Development
 
@@ -113,17 +155,27 @@ python -c "import patchlang_python; print(patchlang_python.validate('template Fo
 
 ## Status
 
-- [ ] Harness (manifest, state, fixtures)
-- [ ] Stage implementations
-- [ ] RAG database
-- [ ] Compiler bridge
-- [ ] Agent extraction
-- [ ] Phase 1 test run
-- [ ] Phase 2 + refinement
-- [ ] Phase 3 + final report
+**Phase 0: Harness Validation** (Current)
+- [x] Ragscallion RAG microservice running
+- [x] Core harness + manifest persistence
+- [x] LangGraph pipeline orchestrator
+- [x] Phase 0 ground truth fixtures (3 devices)
+- [x] Test suite + connectivity checks
+- [ ] Stage implementations (7 stages to build)
+
+**Phase 1: Test Harness** (Next)
+- [ ] Implement all 7 pipeline stages
+- [ ] Validate on 50 known devices
+- [ ] Refine extraction logic based on failures
+
+**Phase 2-3: Scaling** (Follow-up)
+- [ ] 1,500 mid-tier devices
+- [ ] Remaining 2,000+ devices
+- [ ] QA pipeline + sampling validation
 
 ---
 
-**Owner:** ByteBard97 + Reid
-**Status:** Design phase (REQUIREMENTS.md + IMPLEMENTATION.md complete)
-**Next:** Implement harness + stages
+**Repo:** https://github.com/ByteBard97/SignalCanvasDeviceIngestion  
+**Owner:** ByteBard97 + Reid (reidwwall)  
+**Dependency:** https://github.com/ByteBard97/ragscallion (must be running)  
+**Next:** Implement Stage 1-7 pipeline modules
