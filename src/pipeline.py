@@ -1,5 +1,6 @@
 """LangGraph-based pipeline orchestrator for device ingestion."""
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -9,6 +10,8 @@ from pydantic import BaseModel
 
 from .config import settings
 from .harness import IngestionManifest, IngestionNode, IngestionState
+from .pipeline_stages import stage_3_4_submit_to_ragscallion
+from .ragscallion_client import RagscallionClient
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,7 @@ class DeviceIngestionPipeline:
         self.phase = phase
         self.manifest = IngestionManifest(settings.manifests_db)
         self.execution_state = IngestionState(current_phase=phase)
+        self.ragscallion_client = RagscallionClient()
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
@@ -71,7 +75,6 @@ class DeviceIngestionPipeline:
             return "pick_next_device"
 
         graph.add_conditional_edges("complete_device", should_continue)
-        graph.add_edge("report_metrics", None)  # End state
 
         return graph.compile()
 
@@ -134,15 +137,34 @@ class DeviceIngestionPipeline:
         return {"manifest": self.manifest, "execution_state": state.execution_state}
 
     def _stage_index_rag(self, state: PipelineState) -> dict[str, Any]:
-        """Stage 4: Index converted Markdown in Ragscallion RAG."""
+        """Stage 3-4: Submit PDF to Ragscallion for indexing (combined stages).
+
+        This stage combines the Convert Marker (stage 3) and Index RAG (stage 4) operations:
+        - Assumes PDF has been converted to Markdown (stage 2 output)
+        - Submits PDF to Ragscallion with retry logic
+        - Moves device to queue_2 for polling on success
+        - Moves device to queue_4 on collision or transient failure
+        """
         device_id = state.execution_state.current_device_id
         node = self.manifest.get_node(device_id)
 
-        logger.info(f"[Stage 4] Indexing in RAG for {device_id}")
-        # TODO: Implement Ragscallion indexing via SSH
+        logger.info(f"[Stages 3-4] Submitting to Ragscallion for {device_id}")
 
-        self.manifest.add_node(node)
-        state.execution_state.advance_stage()
+        # Run async stage function synchronously
+        success = asyncio.run(
+            stage_3_4_submit_to_ragscallion(
+                node,
+                self.ragscallion_client,
+                self.manifest,
+            )
+        )
+
+        if success:
+            # Advance stage on success
+            state.execution_state.advance_stage()
+        else:
+            # On failure (collision, unavailable), device goes to queue_4 for manual review
+            logger.warning(f"Device {device_id} submission failed, moved to manual review queue")
 
         return {"manifest": self.manifest, "execution_state": state.execution_state}
 
