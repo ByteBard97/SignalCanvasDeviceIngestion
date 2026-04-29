@@ -631,6 +631,62 @@ class SpecExtractorAgent:
 
 ---
 
+## Pre-Pipeline Setup: Ragscallion Health Check
+
+**Before running the pipeline, verify Ragscallion is running on 192.168.0.200:**
+
+```bash
+# Quick health check
+curl http://192.168.0.200:8086/health
+
+# List indexed sources
+curl http://192.168.0.200:8086/sources
+
+# Get stats
+curl http://192.168.0.200:8086/stats
+```
+
+**If Ragscallion is not running:**
+
+```bash
+# SSH to Linux box
+ssh your-username@localhost
+
+# Navigate to ragscallion project
+cd ~/projects/ragscallion
+
+# Start the server
+export PATH=$HOME/.local/bin:$PATH
+nohup uv run python server.py 8086 > /tmp/ragscallion.log 2>&1 &
+
+# Verify it's running
+curl http://localhost:8086/health
+```
+
+**Configuration for pipeline:**
+
+```python
+# Stage 0 (Pre-flight): Health check
+def check_ragscallion_health(config: Config) -> bool:
+    """Verify Ragscallion is running before starting pipeline."""
+    url = f"http://{config.rag_host}:{config.rag_port}/health"
+    try:
+        response = requests.get(url, timeout=5)
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Ragscallion health check failed: {e}")
+        return False
+
+# Pipeline entry point
+if not check_ragscallion_health(config):
+    raise RuntimeError(
+        f"Ragscallion not running at {config.rag_host}:{config.rag_port}. "
+        "Start it with: ssh your-username@localhost '~/projects/ragscallion/scripts/start.sh'"
+    )
+```
+
+---
+
 ## Compiler Integration Details
 
 ### Python Binding Installation
@@ -665,55 +721,82 @@ The SignalCanvasLang repo includes a Python wheel (via PyO3). Integration steps:
 
 ---
 
-## RAG Database Design
+## RAG Integration with Ragscallion
 
-### Option 1: Local SQLite + Sentence Transformers
+**Ragscallion** (https://github.com/ByteBard97/ragscallion) is your existing microservice running on 192.168.0.200. It handles all RAG infrastructure:
+
+- **Vector DB**: LanceDB (embedded, persistent files)
+- **Search Index**: Tantivy (full-text search, BM25)
+- **Embeddings**: BAAI/bge-base-en-v1.5 (768-dim, GPU-accelerated)
+- **Chunking**: Overlapping chunks (~1000 chars), preserves section headers
+
+**Our pipeline delegates RAG to Ragscallion:**
 
 ```python
 class RAGDatabase:
-    def __init__(self, db_path: str):
-        self.db = sqlite3.connect(db_path)
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')  # Small, fast
-        self._init_schema()
+    def __init__(self):
+        self.rag_host = "192.168.0.200"
+        self.rag_port = 8086  # Device library RAG
+        self.base_url = f"http://{self.rag_host}:{self.rag_port}"
     
-    def index_manual(self, device_id: str, markdown: str) -> None:
+    def ingest_markdown(self, device_id: str, markdown_path: str) -> bool:
         """
-        Split markdown into sections, embed each, store in DB.
-        """
-        sections = self._split_sections(markdown)
+        Ingest markdown via Ragscallion's add-paper.sh.
+        Ragscallion handles chunking + embedding automatically.
         
-        for section in sections:
-            embedding = self.embedder.encode(section["text"])
-            self.db.execute(
-                """INSERT INTO embeddings 
-                   (device_id, section_title, section_text, embedding)
-                   VALUES (?, ?, ?, ?)""",
-                (device_id, section["title"], section["text"], 
-                 json.dumps(embedding.tolist()))
-            )
+        Returns: success (bool)
+        """
+        # SSH to Linux box and run ragscallion's ingestion
+        cmd = f"ssh your-username@{self.rag_host} '~/projects/ragscallion/scripts/add-paper.sh {markdown_path} {device_id}'"
+        result = subprocess.run(cmd, shell=True, capture_output=True)
+        return result.returncode == 0
     
-    def search(self, query: str, top_k: int = 5) -> List[str]:
-        """Semantic search across all manuals."""
-        query_embedding = self.embedder.encode(query)
+    def search(self, query: str, device_id: str = None, top_k: int = 5) -> List[str]:
+        """
+        Query Ragscallion's hybrid search (vector + FTS).
+        Returns top-k relevant sections from device manuals.
+        """
+        url = f"{self.base_url}/search"
+        params = {
+            "q": query,
+            "n": top_k,
+            "mode": "hybrid",  # vector + full-text search for best recall
+        }
+        if device_id:
+            params["source"] = device_id  # Filter by specific device manual
         
-        # Cosine similarity search in SQLite
-        results = self.db.execute(
-            """SELECT section_text FROM embeddings
-               ORDER BY embedding <-> ?
-               LIMIT ?""",
-            (json.dumps(query_embedding.tolist()), top_k)
-        ).fetchall()
+        response = requests.get(url, params=params)
+        if response.status_code != 200:
+            raise Exception(f"RAG search failed: {response.text}")
         
-        return [r[0] for r in results]
+        results = response.json()
+        return [r["text"] for r in results.get("results", [])]
+    
+    def list_sources(self) -> List[str]:
+        """List all indexed device manuals."""
+        response = requests.get(f"{self.base_url}/sources")
+        return response.json().get("sources", [])
 ```
 
-### Why SQLite over Chroma/FAISS?
+**Why delegate to Ragscallion?**
 
-- **Local-first**: No external services, no API keys
-- **Simplicity**: Single database file, easy backup
-- **Cost**: Free
-- **Performance**: Fast enough for 4,000 manuals
-- **Portability**: Runs anywhere
+- ✅ **Already running** — 192.168.0.200:8086, proven in production
+- ✅ **GPU-accelerated** — NVIDIA card handles embeddings (768-dim BAAI model)
+- ✅ **Hybrid search** — Both vector + FTS for best recall on technical docs
+- ✅ **Production-grade** — LanceDB used by Hugging Face, LlamaIndex
+- ✅ **No macOS dependencies** — PDFs never touch your laptop, only Linux box
+- ✅ **Proven chunking** — Overlapping chunks with header awareness
+- ✅ **Network isolation** — Device manuals stay on your private network
+
+**Pipeline Flow:**
+
+1. **Stage 3 (Convert Marker)** — macOS downloads PDF → SSH to Linux box
+2. **Stage 4 (Index RAG)** — Call `ragscallion/scripts/add-paper.sh` via SSH
+   - Ragscallion runs Marker internally
+   - Chunks markdown
+   - Creates embeddings (GPU)
+   - Stores in LanceDB
+3. **Stage 5 (Extract Specs)** — Query `/search` endpoint at 192.168.0.200:8086
 
 ---
 
@@ -766,11 +849,13 @@ class Config:
     
     # Stages
     pdf_download_timeout: int = 30  # seconds
-    marker_timeout: int = 60
+    ssh_timeout: int = 120  # Marker can be slow on GPUs
     
-    # RAG
-    rag_db: str = "output/rag.db"
-    embedder_model: str = "all-MiniLM-L6-v2"
+    # Ragscallion RAG (remote microservice)
+    rag_host: str = "192.168.0.200"
+    rag_port: int = 8086
+    rag_ssh_user: str = "your-username"
+    rag_script_path: str = "~/projects/ragscallion/scripts/add-paper.sh"
     
     # Agents
     haiku_model: str = "claude-3-5-haiku-20241022"
@@ -781,6 +866,7 @@ class Config:
     stdlib_output: str = "output/stdlib/devices"
     
     # Phases
+    phase_0_devices: int = 3  # Small batch test
     phase_1_devices: int = 50
     phase_2_devices: int = 1500
     phase_3_limit: int = None  # All remaining
