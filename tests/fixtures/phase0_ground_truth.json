@@ -1,0 +1,82 @@
+{
+  "description": "Phase 0 ground truth test devices for harness validation",
+  "phase": "Phase 0 (3 devices)",
+  "purpose": "Validate pipeline harness works end-to-end before scaling to Phase 1 (50 devices)",
+  "devices": [
+    {
+      "id": "yamaha-r08d",
+      "manufacturer": "YAMAHA",
+      "model": "R08D",
+      "category": "fixed-converter",
+      "description": "8-channel Dante to XLR converter",
+      "specs": {
+        "dante_channels_in": 8,
+        "xlr_channels_out": 8,
+        "kind": "fixed-converter"
+      },
+      "expected_patch": {
+        "templates": ["R08D"],
+        "ports": {
+          "DANTE": "in(RJ45_etherCON) [Dante, flexible, redundant]",
+          "XLR": "out(XLR) [Analogue, flexible]"
+        },
+        "bridge": "DANTE -> XLR"
+      },
+      "notes": "Simple 1:1 converter, good for validating basic signal flow extraction",
+      "difficulty": "easy"
+    },
+    {
+      "id": "audinate-avio-ai2",
+      "manufacturer": "Audinate",
+      "model": "AVIO-AI2",
+      "category": "fixed-converter",
+      "description": "2-channel analog input Dante converter",
+      "specs": {
+        "xlr_channels_in": 2,
+        "dante_channels_out": 2,
+        "kind": "fixed-converter"
+      },
+      "expected_patch": {
+        "templates": ["AVIO_AI2"],
+        "ports": {
+          "XLR": "in(XLR)",
+          "DANTE": "out(RJ45_etherCON)"
+        },
+        "bridge": "XLR -> DANTE"
+      },
+      "notes": "Inverse of R08D (analog in, Dante out). Tests both signal directions",
+      "difficulty": "easy"
+    },
+    {
+      "id": "yamaha-cl5",
+      "manufacturer": "YAMAHA",
+      "model": "CL5",
+      "category": "console",
+      "description": "Yamaha CL5 digital mixing console with Dante networking",
+      "specs": {
+        "dante_in_channels": 64,
+        "dante_out_channels": 64,
+        "kind": "console"
+      },
+      "expected_patch": {
+        "templates": ["CL5"],
+        "ports": {
+          "Dante_In_In": "in(RJ45_etherCON) [Dante]",
+          "Dante_In_Out": "out(RJ45_etherCON) [Dante]"
+        }
+      },
+      "notes": "More complex device with both input and output Dante ports. Tests console-class device extraction",
+      "difficulty": "medium"
+    }
+  ],
+  "success_criteria": {
+    "all_pdf_found": "80%+ (at least 3/3)",
+    "all_pdf_download": "100%",
+    "all_markdown_convert": "100%",
+    "all_rag_indexed": "100%",
+    "all_specs_extracted": "100% (all 3 devices)",
+    "all_patch_generated": "100%",
+    "all_patch_valid": "100% (pass compiler validation)",
+    "estimated_runtime": "< 5 minutes per device"
+  }
+}
