@@ -35,6 +35,7 @@ from .harness.manifest import (
     STAGE_EXTRACT_SPECS,
 )
 from .pipeline_stages import (
+    stage_0_resolve_sku,
     stage_1_find_pdf,
     stage_2_download_pdf,
     stage_3_4_submit_to_ragscallion,
@@ -53,6 +54,31 @@ HARD_CAP_MINUTES = 30
 MAX_CONCURRENT_STAGE_1 = 3
 MAX_CONCURRENT_STAGE_2 = 5
 MAX_CONCURRENT_STAGE_34 = 5
+
+
+async def _run_stage_0_batch(
+    manifest: Manifest,
+    nodes: list[DeviceNode],
+) -> list[DeviceNode]:
+    """Run Stage 0 (resolve alias to canonical SKU) on all nodes concurrently.
+
+    Returns the subset that successfully resolved (or already had a canonical SKU).
+    """
+    if not nodes:
+        return []
+
+    tasks = [stage_0_resolve_sku(node, manifest) for node in nodes]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    successful: list[DeviceNode] = []
+    for node, result in zip(nodes, results):
+        if isinstance(result, Exception):
+            logger.error(f"Device {node.device_id} Stage 0 exception: {result}")
+        elif result:
+            successful.append(node)
+
+    logger.info(f"Stage 0 complete: {len(successful)}/{len(nodes)} resolved")
+    return successful
 
 
 async def _run_stage_1_batch(
@@ -240,9 +266,18 @@ async def run_pipeline(
     start_time = datetime.now(timezone.utc)
 
     try:
-        # Stage 1: Find PDF URLs
+        # Stage 0: Resolve user-facing aliases to canonical manufacturer SKUs
         queue_0_nodes = manifest.list_by_queue(QUEUE_0_INITIAL)
-        stage_1_success = await _run_stage_1_batch(manifest, queue_0_nodes)
+        stage_0_success = await _run_stage_0_batch(manifest, queue_0_nodes)
+
+        # Stage 1: Find PDF URLs (only for nodes that resolved their SKU)
+        # Re-load to pick up canonical_sku written by Stage 0.
+        stage_0_done = [
+            manifest.get_node(n.device_id)
+            for n in stage_0_success
+            if manifest.get_node(n.device_id) and manifest.get_node(n.device_id).canonical_sku
+        ]
+        stage_1_success = await _run_stage_1_batch(manifest, stage_0_done)
 
         # Stage 2: Download PDFs
         # Re-load nodes that completed stage 1 (queue may have changed)

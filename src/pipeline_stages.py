@@ -24,6 +24,7 @@ from .harness.manifest import (
     STAGE_DOWNLOAD_PDF,
     STAGE_INDEX_RAG,
     STAGE_EXTRACT_SPECS,
+    STAGE_RESOLVE_SKU,
 )
 from .ragscallion_client import (
     RagscallionClient,
@@ -51,6 +52,9 @@ EXTRACTION_TIMEOUT_SECONDS = 360  # Consoles (e.g. CL5, SQ-5) need extra search 
 FIND_PDF_TIMEOUT_SECONDS = 120
 FIND_PDF_MAX_STEPS = 5  # tight budget; force fail-fast instead of broad exploration
 FIND_PDF_RETRY_ATTEMPTS = 2  # retry on empty Kimi output or model-mismatch URL
+RESOLVE_SKU_TIMEOUT_SECONDS = 180  # generous: alias lookup may need a few searches
+RESOLVE_SKU_MAX_STEPS = 8  # more breadth than Stage 1 — alias may map to several SKUs
+RESOLVE_SKU_SEMAPHORE = asyncio.Semaphore(3)
 DOWNLOAD_TIMEOUT_SECONDS = 60
 
 # URL relevance heuristic constants
@@ -132,6 +136,137 @@ def _build_find_pdf_prompt(manufacturer: str, model: str, exclude_urls: list[str
     return base
 
 
+def _resolved_sku(node: DeviceNode) -> str:
+    """Return the canonical SKU if Stage 0 ran, else fall back to the raw model alias.
+
+    Centralizing this avoids every later stage having to know whether resolution happened.
+    """
+    return node.canonical_sku or node.model
+
+
+def _build_resolve_sku_prompt(manufacturer: str, alias: str) -> str:
+    """Build the Stage 0 Kimi prompt — alias to canonical manufacturer SKU."""
+    return (
+        f'A user typed the device name "{manufacturer} {alias}". This may be the '
+        f'canonical manufacturer SKU/part number, OR it may be a colloquial alias '
+        f'(e.g. "AVIO-AO2" is shorthand for Audinate\'s "ADP-DAO-AU-0X2", a 2-channel '
+        f'Dante AVIO Analog Output adapter).\n\n'
+        f'Web search the manufacturer\'s site to identify the canonical SKU and '
+        f'product name. Reply with ONLY this JSON line:\n'
+        f'  {{"canonical_sku":"<sku>","product_name":"<full product name>","is_alias":<true|false>}}\n'
+        f'Set is_alias=false if "{alias}" is already the canonical SKU; set true if you '
+        f'had to map it. If you cannot identify the product, reply '
+        f'{{"canonical_sku":null,"product_name":null,"is_alias":null}}. '
+        f'No commentary.'
+    )
+
+
+async def stage_0_resolve_sku(
+    node: DeviceNode,
+    manifest: Manifest,
+) -> bool:
+    """Stage 0: Resolve user-facing alias to canonical manufacturer SKU.
+
+    Input:
+        node: Device node with manufacturer + model (model may be a colloquial alias).
+
+    Output:
+        True if canonical_sku populated, stage_resolve_sku=COMPLETED.
+        False if failure metadata set, moved to QUEUE_1_CANNOT_FIND_PDF.
+
+    Side Effects:
+        - Updates node: canonical_sku, canonical_product_name, stage_resolve_sku.
+        - Persists node to manifest.
+
+    Idempotent: if canonical_sku is already set, returns True without re-running.
+    """
+    if node.canonical_sku:
+        return True
+
+    async with RESOLVE_SKU_SEMAPHORE:
+        from .kimi_runner import run_kimi, extract_json_block
+
+        repo_root = Path(__file__).resolve().parent.parent
+        skills_dir = repo_root / ".claude" / "skills"
+
+        prompt = _build_resolve_sku_prompt(node.manufacturer, node.model)
+
+        try:
+            stdout = await run_kimi(
+                prompt,
+                skills_dir=skills_dir,
+                work_dir=repo_root,
+                timeout=RESOLVE_SKU_TIMEOUT_SECONDS,
+                max_steps=RESOLVE_SKU_MAX_STEPS,
+            )
+        except Exception as e:
+            logger.error(f"Device {node.device_id} Stage 0 Kimi invocation failed: {e}")
+            stdout = None
+
+        if not stdout:
+            _set_stage_failure(
+                node,
+                manifest,
+                stage=STAGE_RESOLVE_SKU,
+                category=FailureCategory.SKU_RESOLUTION_FAILED,
+                message="Kimi CLI returned no output or failed",
+                retryable=True,
+            )
+            return False
+
+        json_block = extract_json_block(stdout)
+        if not json_block:
+            _set_stage_failure(
+                node,
+                manifest,
+                stage=STAGE_RESOLVE_SKU,
+                category=FailureCategory.SKU_RESOLUTION_FAILED,
+                message=f"Kimi returned unparseable output: {stdout[:500]}",
+                retryable=True,
+            )
+            return False
+
+        try:
+            data = json.loads(json_block)
+        except json.JSONDecodeError as e:
+            _set_stage_failure(
+                node,
+                manifest,
+                stage=STAGE_RESOLVE_SKU,
+                category=FailureCategory.SKU_RESOLUTION_FAILED,
+                message=f"JSON parse error: {e}. Raw: {json_block[:500]}",
+                retryable=True,
+            )
+            return False
+
+        sku = data.get("canonical_sku") if isinstance(data, dict) else None
+        product_name = data.get("product_name") if isinstance(data, dict) else None
+        if not sku or not isinstance(sku, str):
+            _set_stage_failure(
+                node,
+                manifest,
+                stage=STAGE_RESOLVE_SKU,
+                category=FailureCategory.SKU_RESOLUTION_FAILED,
+                message=f"Kimi could not identify canonical SKU. Raw: {json_block[:500]}",
+                retryable=True,
+            )
+            return False
+
+        node.canonical_sku = sku.strip()
+        node.canonical_product_name = product_name.strip() if isinstance(product_name, str) else None
+        node.stage_resolve_sku = STAGE_COMPLETED
+        manifest.persist(node)
+
+        if node.canonical_sku.lower() != node.model.lower():
+            logger.info(
+                f"Device {node.device_id} alias resolved: "
+                f"{node.model!r} -> {node.canonical_sku!r} ({node.canonical_product_name!r})"
+            )
+        else:
+            logger.info(f"Device {node.device_id} input is already canonical SKU: {node.canonical_sku}")
+        return True
+
+
 async def stage_1_find_pdf(
     node: DeviceNode,
     manifest: Manifest,
@@ -163,9 +298,10 @@ async def stage_1_find_pdf(
 
         rejected_urls: list[str] = []
         last_failure_message = "Kimi CLI returned no output or failed"
+        sku_for_search = _resolved_sku(node)
 
         for attempt in range(1, FIND_PDF_RETRY_ATTEMPTS + 1):
-            prompt = _build_find_pdf_prompt(node.manufacturer, node.model, rejected_urls)
+            prompt = _build_find_pdf_prompt(node.manufacturer, sku_for_search, rejected_urls)
 
             try:
                 stdout = await run_kimi(
@@ -208,9 +344,9 @@ async def stage_1_find_pdf(
                     rejected_urls.append(pdf_url)
                     continue
 
-            if not _url_likely_matches_model(pdf_url, node.model):
+            if not _url_likely_matches_model(pdf_url, sku_for_search):
                 last_failure_message = (
-                    f"URL filename does not match model {node.model}: {pdf_url}"
+                    f"URL filename does not match model {sku_for_search}: {pdf_url}"
                 )
                 logger.warning(
                     f"Device {node.device_id} Stage 1 attempt {attempt}: rejecting wrong-device URL {pdf_url}"
@@ -343,7 +479,13 @@ def _set_stage_failure(
     node.failure_retryable = retryable
     node.failure_attempts += 1
     node.failure_at = datetime.now(timezone.utc).isoformat()
-    node.queue = QUEUE_1_CANNOT_FIND_PDF if stage <= STAGE_DOWNLOAD_PDF else QUEUE_4_MANUAL_REVIEW
+    # Stage 0 (RESOLVE_SKU) and Stage 1 (FIND_PDF) / Stage 2 (DOWNLOAD_PDF) are all
+    # input-acquisition failures — the user can fix the input and retry. Everything
+    # later is a content/processing failure that needs human review.
+    if stage in (STAGE_RESOLVE_SKU, STAGE_FIND_PDF, STAGE_DOWNLOAD_PDF):
+        node.queue = QUEUE_1_CANNOT_FIND_PDF
+    else:
+        node.queue = QUEUE_4_MANUAL_REVIEW
 
     stage_attrs = [
         "stage_find_pdf",
@@ -353,6 +495,7 @@ def _set_stage_failure(
         "stage_extract_specs",
         "stage_generate_patch",
         "stage_validate_patch",
+        "stage_resolve_sku",  # index 7 = STAGE_RESOLVE_SKU
     ]
     if 0 <= stage < len(stage_attrs):
         setattr(node, stage_attrs[stage], STAGE_FAILED)

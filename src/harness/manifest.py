@@ -22,6 +22,9 @@ class StageStatus(str, Enum):
 
 class FailureCategory(str, Enum):
     """Categorized failure reasons for analysis and retry."""
+    # Stage 0 failure (alias -> canonical SKU resolution)
+    SKU_RESOLUTION_FAILED = "SKU_RESOLUTION_FAILED" # retryable: yes (user can supply SKU)
+
     # Stage 1-2 failures (PDF acquisition)
     PDF_NOT_FOUND = "PDF_NOT_FOUND"                 # retryable: yes (user can provide URL)
     PDF_DOWNLOAD_FAILED = "PDF_DOWNLOAD_FAILED"     # retryable: yes (retry download)
@@ -58,6 +61,7 @@ STAGE_INDEX_RAG = 3
 STAGE_EXTRACT_SPECS = 4
 STAGE_GENERATE_PATCH = 5
 STAGE_VALIDATE_PATCH = 6
+STAGE_RESOLVE_SKU = 7  # Conceptually first; numbered last to avoid renumbering historical data
 
 QUEUE_0_INITIAL = 0
 QUEUE_1_READY_FOR_PROCESSING = 1
@@ -83,6 +87,7 @@ class DeviceNode:
     corpus_id: Optional[str] = None
 
     # Stage tracking: 0=NOT_STARTED, 1=IN_PROGRESS, 2=COMPLETED, 3=FAILED
+    stage_resolve_sku: int = 0
     stage_find_pdf: int = 0
     stage_download_pdf: int = 0
     stage_convert_marker: int = 0
@@ -90,6 +95,10 @@ class DeviceNode:
     stage_extract_specs: int = 0
     stage_generate_patch: int = 0
     stage_validate_patch: int = 0
+
+    # Canonical product identity (resolved from user-facing alias by Stage 0)
+    canonical_sku: Optional[str] = None
+    canonical_product_name: Optional[str] = None
 
     # PDF artifacts
     pdf_url: Optional[str] = None
@@ -246,9 +255,26 @@ class Manifest:
                     failure_at TEXT,
                     queue INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    stage_resolve_sku INTEGER DEFAULT 0,
+                    canonical_sku TEXT,
+                    canonical_product_name TEXT
                 )
             """)
+
+            # Migration: add columns if missing (for DBs created before Stage 0).
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(device_nodes)").fetchall()
+            }
+            migrations = [
+                ("stage_resolve_sku", "INTEGER DEFAULT 0"),
+                ("canonical_sku", "TEXT"),
+                ("canonical_product_name", "TEXT"),
+            ]
+            for col, ddl in migrations:
+                if col not in existing_cols:
+                    conn.execute(f"ALTER TABLE device_nodes ADD COLUMN {col} {ddl}")
+
             conn.commit()
 
     def _recover_from_crash(self):
@@ -275,6 +301,7 @@ class Manifest:
     def _is_mid_stage(self, node: DeviceNode) -> bool:
         """Check if node is in middle of a stage (0=NOT_STARTED, 1=IN_PROGRESS)."""
         stages = [
+            node.stage_resolve_sku,
             node.stage_find_pdf,
             node.stage_download_pdf,
             node.stage_convert_marker,
@@ -288,6 +315,7 @@ class Manifest:
     def _restart_mid_stage(self, node: DeviceNode, conn: sqlite3.Connection):
         """Restart a stage that was interrupted mid-execution."""
         stages = [
+            "stage_resolve_sku",
             "stage_find_pdf", "stage_download_pdf", "stage_convert_marker",
             "stage_index_rag", "stage_extract_specs", "stage_generate_patch",
             "stage_validate_patch",
@@ -306,7 +334,12 @@ class Manifest:
             self._persist_node(node, conn)
 
     def _node_to_row(self, node: DeviceNode) -> tuple:
-        """Convert DeviceNode to SQLite row tuple."""
+        """Convert DeviceNode to SQLite row tuple.
+
+        Column order matches the CREATE TABLE statement; new columns added by
+        ALTER TABLE are appended (SQLite always appends), so Stage-0-related
+        columns sit at the end.
+        """
         return (
             node.device_id, node.manufacturer, node.model, node.corpus_id,
             node.stage_find_pdf, node.stage_download_pdf, node.stage_convert_marker,
@@ -319,6 +352,7 @@ class Manifest:
             node.failure_stage, node.failure_category, node.failure_message,
             node.failure_retryable, node.failure_attempts, node.failure_at,
             node.queue, node.created_at, node.updated_at,
+            node.stage_resolve_sku, node.canonical_sku, node.canonical_product_name,
         )
 
     def _row_to_node(self, row: tuple) -> DeviceNode:
@@ -335,6 +369,7 @@ class Manifest:
             "failure_stage", "failure_category", "failure_message",
             "failure_retryable", "failure_attempts", "failure_at",
             "queue", "created_at", "updated_at",
+            "stage_resolve_sku", "canonical_sku", "canonical_product_name",
         ]
         data = dict(zip(keys, row))
         # Convert SQLite booleans (0/1) to Python booleans
@@ -347,7 +382,7 @@ class Manifest:
         conn.execute("""
             INSERT OR REPLACE INTO device_nodes VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
         """, self._node_to_row(node))
 
@@ -423,6 +458,7 @@ class Manifest:
             "stage_find_pdf", "stage_download_pdf", "stage_convert_marker",
             "stage_index_rag", "stage_extract_specs",
             "stage_generate_patch", "stage_validate_patch",
+            "stage_resolve_sku",  # index 7 = STAGE_RESOLVE_SKU
         ]
         if stage < 0 or stage >= len(stages):
             raise ValueError(f"Invalid stage {stage}")
@@ -468,6 +504,7 @@ class Manifest:
             # Count by stage completion
             stage_counts = {}
             for stage_col in [
+                "stage_resolve_sku",
                 "stage_find_pdf", "stage_download_pdf", "stage_convert_marker",
                 "stage_index_rag", "stage_extract_specs", "stage_generate_patch",
                 "stage_validate_patch"
