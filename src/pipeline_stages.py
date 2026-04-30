@@ -56,6 +56,10 @@ RESOLVE_SKU_TIMEOUT_SECONDS = 180  # generous: alias lookup may need a few searc
 RESOLVE_SKU_MAX_STEPS = 8  # more breadth than Stage 1 — alias may map to several SKUs
 RESOLVE_SKU_SEMAPHORE = asyncio.Semaphore(3)
 DOWNLOAD_TIMEOUT_SECONDS = 60
+DOWNLOAD_FALLBACK_ATTEMPTS = 1  # if first URL fails (e.g. bad cert), ask Kimi for one alternate
+FALLBACK_URL_TIMEOUT_SECONDS = 90
+FALLBACK_URL_MAX_STEPS = 5
+FALLBACK_URL_KIMI_RETRIES = 2  # the kimi CLI itself occasionally exits non-zero; retry once
 
 # URL relevance heuristic constants
 _OPAQUE_SLUG_MIN_LEN = 12  # below this, treat slug as a product code, not a hash
@@ -142,6 +146,32 @@ def _resolved_sku(node: DeviceNode) -> str:
     Centralizing this avoids every later stage having to know whether resolution happened.
     """
     return node.canonical_sku or node.model
+
+
+def _build_fallback_url_prompt(
+    manufacturer: str,
+    sku: str,
+    failed_url: str,
+    error_summary: str,
+    tried_urls: list[str],
+) -> str:
+    """Build the Stage 2 fallback prompt — request an alternate URL after a download failure.
+
+    Strongly prefers manufacturer-direct hosting over reseller CDN aggregators
+    (e.g. av-iq.com, gearank.com), which are the usual source of broken cert chains.
+    """
+    return (
+        f'The PDF URL previously found for "{manufacturer} {sku}" failed to download.\n'
+        f'  URL: {failed_url}\n'
+        f'  Error: {error_summary}\n\n'
+        f'Find an ALTERNATE PDF URL for the same product. STRONGLY PREFER the '
+        f'manufacturer\'s own domain (e.g. {manufacturer.lower()}.com or their official '
+        f'documentation portal) over reseller, distributor, or aggregator CDNs. '
+        f'Do ONE web search and reply with ONLY this JSON line: '
+        f'{{"pdf_url":"<url>"}}. If no alternate URL exists, reply '
+        f'{{"pdf_url":null}}. Already-tried URLs to avoid: {json.dumps(tried_urls)}. '
+        f'No commentary.'
+    )
 
 
 def _build_resolve_sku_prompt(manufacturer: str, alias: str) -> str:
@@ -428,39 +458,164 @@ async def stage_2_download_pdf(
         cache_dir.mkdir(parents=True, exist_ok=True)
         pdf_path = cache_dir / f"{node.device_id}.pdf"
 
+        tried_urls: list[str] = []
+        current_url = node.pdf_url
+        last_error = "no attempts made"
+
+        for attempt in range(1 + DOWNLOAD_FALLBACK_ATTEMPTS):
+            tried_urls.append(current_url)
+
+            try:
+                async with httpx.AsyncClient(
+                    follow_redirects=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
+                ) as client:
+                    resp = await client.get(current_url)
+                    resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                # Server reached, returned 4xx/5xx. Don't waste a fallback on this —
+                # an HTTP error code is a definitive "no" from the server, not
+                # an infrastructure issue Kimi can route around.
+                _set_stage_failure(
+                    node,
+                    manifest,
+                    stage=STAGE_DOWNLOAD_PDF,
+                    category=FailureCategory.PDF_DOWNLOAD_FAILED,
+                    message=f"HTTP download error: {e}",
+                    retryable=True,
+                )
+                return False
+            except Exception as e:
+                # Connection-level failure (SSL cert chain, DNS, timeout, refused).
+                # The URL itself is unreachable; an alternate manufacturer-direct URL
+                # often works. Try one Kimi fallback before giving up.
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"Device {node.device_id} Stage 2 attempt {attempt + 1} download failed "
+                    f"({last_error}); trying fallback URL" if attempt < DOWNLOAD_FALLBACK_ATTEMPTS
+                    else f"Device {node.device_id} Stage 2 attempt {attempt + 1} download failed ({last_error})"
+                )
+                if attempt < DOWNLOAD_FALLBACK_ATTEMPTS:
+                    alt_url = await _request_alternate_pdf_url(
+                        manufacturer=node.manufacturer,
+                        sku=_resolved_sku(node),
+                        failed_url=current_url,
+                        error_summary=last_error,
+                        tried_urls=tried_urls,
+                    )
+                    if alt_url:
+                        current_url = alt_url
+                        continue
+                _set_stage_failure(
+                    node,
+                    manifest,
+                    stage=STAGE_DOWNLOAD_PDF,
+                    category=FailureCategory.PDF_DOWNLOAD_FAILED,
+                    message=f"HTTP download error after {len(tried_urls)} URL(s): {last_error}",
+                    retryable=True,
+                )
+                return False
+
+            content = resp.content
+            if len(content) < 4 or content[:4] != b"%PDF":
+                _set_stage_failure(
+                    node,
+                    manifest,
+                    stage=STAGE_DOWNLOAD_PDF,
+                    category=FailureCategory.PDF_INVALID,
+                    message="Downloaded file is not a valid PDF (first 4 bytes != %PDF)",
+                    retryable=False,
+                )
+                return False
+
+            # Success: persist whichever URL actually worked (may differ from the original).
+            pdf_path.write_bytes(content)
+            node.pdf_url = current_url
+            node.pdf_path = str(pdf_path)
+            node.stage_download_pdf = STAGE_COMPLETED
+            manifest.persist(node)
+            logger.info(
+                f"Device {node.device_id} PDF downloaded to {pdf_path} ({len(content)} bytes)"
+                + (f" via fallback URL {current_url}" if len(tried_urls) > 1 else "")
+            )
+            return True
+
+        # Loop exited without success or explicit failure (shouldn't happen).
+        _set_stage_failure(
+            node,
+            manifest,
+            stage=STAGE_DOWNLOAD_PDF,
+            category=FailureCategory.PDF_DOWNLOAD_FAILED,
+            message=f"Exhausted {len(tried_urls)} URL(s) without success. Last: {last_error}",
+            retryable=True,
+        )
+        return False
+
+
+async def _request_alternate_pdf_url(
+    *,
+    manufacturer: str,
+    sku: str,
+    failed_url: str,
+    error_summary: str,
+    tried_urls: list[str],
+) -> Optional[str]:
+    """Ask Kimi for an alternate PDF URL after a download-time connection failure.
+
+    Returns a stripped URL string, or None if Kimi cannot find one or the response
+    is malformed. The caller is responsible for re-attempting the download with the
+    returned URL — this function does not touch the manifest.
+    """
+    from .kimi_runner import run_kimi, extract_json_block
+
+    repo_root = Path(__file__).resolve().parent.parent
+    skills_dir = repo_root / ".claude" / "skills"
+
+    prompt = _build_fallback_url_prompt(
+        manufacturer=manufacturer,
+        sku=sku,
+        failed_url=failed_url,
+        error_summary=error_summary,
+        tried_urls=tried_urls,
+    )
+
+    # Kimi CLI occasionally exits non-zero with empty stderr (transient agentic-loop
+    # state). One retry covers it without amplifying cost on real failures.
+    stdout = None
+    for kimi_attempt in range(1, FALLBACK_URL_KIMI_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=DOWNLOAD_TIMEOUT_SECONDS) as client:
-                resp = await client.get(node.pdf_url)
-                resp.raise_for_status()
+            stdout = await run_kimi(
+                prompt,
+                skills_dir=skills_dir,
+                work_dir=repo_root,
+                timeout=FALLBACK_URL_TIMEOUT_SECONDS,
+                max_steps=FALLBACK_URL_MAX_STEPS,
+            )
         except Exception as e:
-            _set_stage_failure(
-                node,
-                manifest,
-                stage=STAGE_DOWNLOAD_PDF,
-                category=FailureCategory.PDF_DOWNLOAD_FAILED,
-                message=f"HTTP download error: {e}",
-                retryable=True,
+            logger.error(f"Stage 2 fallback Kimi invocation failed (attempt {kimi_attempt}): {e}")
+            stdout = None
+        if stdout:
+            break
+        if kimi_attempt < FALLBACK_URL_KIMI_RETRIES:
+            logger.warning(
+                f"Stage 2 fallback Kimi returned empty (attempt {kimi_attempt}); retrying"
             )
-            return False
 
-        content = resp.content
-        if len(content) < 4 or content[:4] != b"%PDF":
-            _set_stage_failure(
-                node,
-                manifest,
-                stage=STAGE_DOWNLOAD_PDF,
-                category=FailureCategory.PDF_INVALID,
-                message="Downloaded file is not a valid PDF (first 4 bytes != %PDF)",
-                retryable=False,
-            )
-            return False
+    if not stdout:
+        return None
 
-        pdf_path.write_bytes(content)
-        node.pdf_path = str(pdf_path)
-        node.stage_download_pdf = STAGE_COMPLETED
-        manifest.persist(node)
-        logger.info(f"Device {node.device_id} PDF downloaded to {pdf_path} ({len(content)} bytes)")
-        return True
+    json_block = extract_json_block(stdout)
+    if not json_block:
+        return None
+
+    try:
+        data = json.loads(json_block)
+    except json.JSONDecodeError:
+        return None
+
+    alt_url = data.get("pdf_url") if isinstance(data, dict) else None
+    if not alt_url or not isinstance(alt_url, str):
+        return None
+    return alt_url.strip()
 
 
 def _set_stage_failure(
