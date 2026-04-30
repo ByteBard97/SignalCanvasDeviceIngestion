@@ -7,6 +7,7 @@ Stages use constants for queue IDs and stage codes (no magic numbers).
 import asyncio
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from .harness.manifest import (
@@ -39,7 +40,7 @@ EXTRACTION_SEMAPHORE = asyncio.Semaphore(5)  # Max 5 concurrent Haiku calls
 
 # Concurrency constants (no magic numbers)
 MAX_CONCURRENT_EXTRACTIONS = 5
-EXTRACTION_TIMEOUT_SECONDS = 60
+EXTRACTION_TIMEOUT_SECONDS = 180
 
 
 async def stage_3_4_submit_to_ragscallion(
@@ -243,9 +244,11 @@ async def _extract_specs_via_agent(
     corpus_id: str,
     rag_search,
 ) -> Optional[str]:
-    """Extract device specs via Haiku agent using RAG context.
+    """Extract device specs via Kimi CLI using RAG context.
 
-    Placeholder for actual agent implementation.
+    Builds a prompt with device metadata and Ragscallion coordinates, shells out
+    to the Kimi CLI (with the device-extraction skill), and parses the resulting
+    JSON from stdout.
 
     Args:
         manufacturer: Device manufacturer (e.g., "YAMAHA")
@@ -255,14 +258,41 @@ async def _extract_specs_via_agent(
 
     Returns:
         JSON string of extracted specs, or None if extraction failed.
-
-    TODO:
-        - Implement actual Haiku agent call
-        - Query corpus for device specs
-        - Parse agent response into structured JSON
     """
-    # TODO: Replace with actual Haiku agent implementation
-    return None
+    from .kimi_runner import run_kimi, extract_json_block
+
+    repo_root = Path(__file__).resolve().parent.parent
+    skills_dir = repo_root / ".claude" / "skills"
+
+    ragscallion_base_url = "http://192.168.0.200:8086"
+
+    prompt = (
+        f"You are the SignalCanvas device-extraction agent.\n"
+        f"Use the device-extraction skill.\n"
+        f"\n"
+        f"Inputs:\n"
+        f"- manufacturer: {manufacturer}\n"
+        f"- model: {model}\n"
+        f"- corpus_id: {corpus_id}\n"
+        f"- ragscallion_base_url: {ragscallion_base_url}\n"
+        f"\n"
+        f"Task:\n"
+        f"1. Query the Ragscallion corpus with targeted curl searches.\n"
+        f"2. Extract a structured device template.\n"
+        f"3. Emit ONLY valid JSON on stdout — no markdown, no explanations.\n"
+    )
+
+    stdout = await run_kimi(
+        prompt,
+        skills_dir=skills_dir,
+        work_dir=repo_root,
+        timeout=EXTRACTION_TIMEOUT_SECONDS,
+    )
+    if stdout is None:
+        return None
+
+    json_block = extract_json_block(stdout)
+    return json_block
 
 
 async def process_stage_5_batch(
