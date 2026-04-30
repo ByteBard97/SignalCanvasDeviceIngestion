@@ -50,7 +50,86 @@ MAX_CONCURRENT_EXTRACTIONS = 5
 EXTRACTION_TIMEOUT_SECONDS = 360  # Consoles (e.g. CL5, SQ-5) need extra search time
 FIND_PDF_TIMEOUT_SECONDS = 120
 FIND_PDF_MAX_STEPS = 5  # tight budget; force fail-fast instead of broad exploration
+FIND_PDF_RETRY_ATTEMPTS = 2  # retry on empty Kimi output or model-mismatch URL
 DOWNLOAD_TIMEOUT_SECONDS = 60
+
+# URL relevance heuristic constants
+_OPAQUE_SLUG_MIN_LEN = 12  # below this, treat slug as a product code, not a hash
+_OPAQUE_SLUG_HEX_RATIO = 0.7  # ratio of hex chars above which slug is "opaque"
+_MODEL_TOKEN_MIN_LEN = 2  # ignore single-character model tokens like "5" in "SQ-5"
+
+
+def _model_tokens(model: str) -> list[str]:
+    """Split a model string into significant tokens.
+
+    Splits on non-alphanumeric punctuation AND on letter/digit boundaries, so
+    'ULXD4' yields ['ULXD', '4'] (matching shure.com/view/guide/ULXD/...) and
+    'Rio1608-D2' yields ['Rio', '1608', 'D', '2'].
+    Tokens shorter than _MODEL_TOKEN_MIN_LEN are dropped.
+    """
+    import re
+    raw = re.split(r"[^A-Za-z0-9]+", model)
+    tokens: list[str] = []
+    for chunk in raw:
+        # Split letter→digit and digit→letter transitions
+        for sub in re.findall(r"[A-Za-z]+|[0-9]+", chunk):
+            tokens.append(sub)
+    return [t for t in tokens if len(t) >= _MODEL_TOKEN_MIN_LEN]
+
+
+def _looks_opaque(slug: str) -> bool:
+    """A slug like '1078f753f2bbafa663cc873b1299a43e1fd6' carries no product hint.
+
+    Treat as opaque only when long enough to plausibly be a content hash; short
+    slugs like 'adp' are product codes, not hashes, and must be checked.
+    """
+    if len(slug) < _OPAQUE_SLUG_MIN_LEN:
+        return False
+    hex_count = sum(1 for c in slug.lower() if c in "0123456789abcdef")
+    return hex_count / len(slug) > _OPAQUE_SLUG_HEX_RATIO
+
+
+def _url_likely_matches_model(url: str, model: str) -> bool:
+    """Return False when the URL filename looks like a product code unrelated to the model.
+
+    Accepts the URL when:
+      - any model token appears in the URL path, or
+      - the filename is opaque (CDN content hash) — we can't tell from the URL.
+
+    Rejects only when the filename is name-like but contains no model token,
+    e.g. AVIO-AO2 vs '.../dataSheet/ADP.pdf'.
+    """
+    from urllib.parse import urlparse
+    path = urlparse(url).path.lower()
+    slug = path.rsplit("/", 1)[-1]
+    if slug.endswith(".pdf"):
+        slug = slug[:-4]
+    tokens = [t.lower() for t in _model_tokens(model)]
+    if not tokens:
+        return True
+    if any(t in path for t in tokens):
+        return True
+    if _looks_opaque(slug):
+        return True
+    return False
+
+
+def _build_find_pdf_prompt(manufacturer: str, model: str, exclude_urls: list[str]) -> str:
+    """Build the Stage 1 Kimi prompt, optionally excluding URLs from a previous attempt."""
+    base = (
+        f'Web search for the official manufacturer datasheet PDF URL of '
+        f'"{manufacturer} {model}". '
+        f'Do ONE web search, pick the best result that ends in .pdf, and reply '
+        f'with ONLY this JSON line: {{"pdf_url":"<url>"}}. '
+        f'If no PDF URL is in the search results, reply: {{"pdf_url":null}}. '
+        f'No commentary.'
+    )
+    if exclude_urls:
+        base += (
+            f' The following URLs were already rejected as wrong-device or unreachable; '
+            f'do NOT return them: {json.dumps(exclude_urls)}.'
+        )
+    return base
 
 
 async def stage_1_find_pdf(
@@ -82,98 +161,78 @@ async def stage_1_find_pdf(
         repo_root = Path(__file__).resolve().parent.parent
         skills_dir = repo_root / ".claude" / "skills"
 
-        # Tight constrained prompt: one search, pick the best result, return immediately.
-        # Earlier versions let Kimi run an open-ended agentic search and it would burn
-        # 30 steps over 6 minutes without producing a final answer.
-        prompt = (
-            f'Web search for the official manufacturer datasheet PDF URL of '
-            f'"{node.manufacturer} {node.model}". '
-            f'Do ONE web search, pick the best result that ends in .pdf, and reply '
-            f'with ONLY this JSON line: {{"pdf_url":"<url>"}}. '
-            f'If no PDF URL is in the search results, reply: {{"pdf_url":null}}. '
-            f'No commentary.'
-        )
+        rejected_urls: list[str] = []
+        last_failure_message = "Kimi CLI returned no output or failed"
 
-        try:
-            stdout = await run_kimi(
-                prompt,
-                skills_dir=skills_dir,
-                work_dir=repo_root,
-                timeout=FIND_PDF_TIMEOUT_SECONDS,
-                max_steps=FIND_PDF_MAX_STEPS,
-            )
-        except Exception as e:
-            logger.error(f"Device {node.device_id} Kimi invocation failed: {e}")
-            stdout = None
+        for attempt in range(1, FIND_PDF_RETRY_ATTEMPTS + 1):
+            prompt = _build_find_pdf_prompt(node.manufacturer, node.model, rejected_urls)
 
-        if not stdout:
-            _set_stage_failure(
-                node,
-                manifest,
-                stage=STAGE_FIND_PDF,
-                category=FailureCategory.PDF_NOT_FOUND,
-                message="Kimi CLI returned no output or failed",
-                retryable=True,
-            )
-            return False
-
-        json_block = extract_json_block(stdout)
-        if not json_block:
-            _set_stage_failure(
-                node,
-                manifest,
-                stage=STAGE_FIND_PDF,
-                category=FailureCategory.PDF_NOT_FOUND,
-                message=f"Kimi returned unparseable output: {stdout[:500]}",
-                retryable=True,
-            )
-            return False
-
-        try:
-            data = json.loads(json_block)
-        except json.JSONDecodeError as e:
-            _set_stage_failure(
-                node,
-                manifest,
-                stage=STAGE_FIND_PDF,
-                category=FailureCategory.PDF_NOT_FOUND,
-                message=f"JSON parse error: {e}. Raw: {json_block[:500]}",
-                retryable=True,
-            )
-            return False
-
-        pdf_url = data.get("pdf_url") if isinstance(data, dict) else None
-        if not pdf_url or not isinstance(pdf_url, str):
-            _set_stage_failure(
-                node,
-                manifest,
-                stage=STAGE_FIND_PDF,
-                category=FailureCategory.PDF_NOT_FOUND,
-                message=f"Kimi JSON missing 'pdf_url' field. Raw: {json_block[:500]}",
-                retryable=True,
-            )
-            return False
-
-        pdf_url = pdf_url.strip()
-        if not pdf_url.lower().endswith(".pdf"):
-            # Try a HEAD request to verify content-type
-            is_pdf = await _verify_pdf_content_type(pdf_url)
-            if not is_pdf:
-                _set_stage_failure(
-                    node,
-                    manifest,
-                    stage=STAGE_FIND_PDF,
-                    category=FailureCategory.PDF_NOT_FOUND,
-                    message=f"URL does not end in .pdf and HEAD returned non-PDF: {pdf_url}",
-                    retryable=True,
+            try:
+                stdout = await run_kimi(
+                    prompt,
+                    skills_dir=skills_dir,
+                    work_dir=repo_root,
+                    timeout=FIND_PDF_TIMEOUT_SECONDS,
+                    max_steps=FIND_PDF_MAX_STEPS,
                 )
-                return False
+            except Exception as e:
+                logger.error(f"Device {node.device_id} Kimi invocation failed (attempt {attempt}): {e}")
+                stdout = None
 
-        node.pdf_url = pdf_url
-        node.stage_find_pdf = STAGE_COMPLETED
-        manifest.persist(node)
-        logger.info(f"Device {node.device_id} PDF URL found: {pdf_url}")
-        return True
+            if not stdout:
+                last_failure_message = f"Kimi CLI returned no output (attempt {attempt})"
+                logger.warning(f"Device {node.device_id} Stage 1 attempt {attempt}: empty output")
+                continue
+
+            json_block = extract_json_block(stdout)
+            if not json_block:
+                last_failure_message = f"Kimi returned unparseable output: {stdout[:500]}"
+                continue
+
+            try:
+                data = json.loads(json_block)
+            except json.JSONDecodeError as e:
+                last_failure_message = f"JSON parse error: {e}. Raw: {json_block[:500]}"
+                continue
+
+            pdf_url = data.get("pdf_url") if isinstance(data, dict) else None
+            if not pdf_url or not isinstance(pdf_url, str):
+                last_failure_message = f"Kimi JSON missing 'pdf_url' field. Raw: {json_block[:500]}"
+                continue
+
+            pdf_url = pdf_url.strip()
+            if not pdf_url.lower().endswith(".pdf"):
+                is_pdf = await _verify_pdf_content_type(pdf_url)
+                if not is_pdf:
+                    last_failure_message = f"URL does not end in .pdf and HEAD returned non-PDF: {pdf_url}"
+                    rejected_urls.append(pdf_url)
+                    continue
+
+            if not _url_likely_matches_model(pdf_url, node.model):
+                last_failure_message = (
+                    f"URL filename does not match model {node.model}: {pdf_url}"
+                )
+                logger.warning(
+                    f"Device {node.device_id} Stage 1 attempt {attempt}: rejecting wrong-device URL {pdf_url}"
+                )
+                rejected_urls.append(pdf_url)
+                continue
+
+            node.pdf_url = pdf_url
+            node.stage_find_pdf = STAGE_COMPLETED
+            manifest.persist(node)
+            logger.info(f"Device {node.device_id} PDF URL found (attempt {attempt}): {pdf_url}")
+            return True
+
+        _set_stage_failure(
+            node,
+            manifest,
+            stage=STAGE_FIND_PDF,
+            category=FailureCategory.PDF_NOT_FOUND,
+            message=f"All {FIND_PDF_RETRY_ATTEMPTS} attempts failed. Last: {last_failure_message}",
+            retryable=True,
+        )
+        return False
 
 
 async def _verify_pdf_content_type(url: str) -> bool:
