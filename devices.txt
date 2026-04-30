@@ -1,0 +1,5 @@
+YAMAHA|Rio1608-D2|yamaha-rio1608-d2
+AUDINATE|AVIO-AO2|audinate-avio-ao2
+SHURE|ULXD4|shure-ulxd4
+ALLEN_HEATH|SQ-5|allen-heath-sq5
+SENNHEISER|EW-DX-EM|sennheiser-ew-dx-em

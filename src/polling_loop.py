@@ -73,6 +73,9 @@ async def run_polling_loop(
                 # Handle both formats: "2026-04-29T10:30:45.123Z" and ISO with TZ
                 if server_now_str.endswith('Z'):
                     server_now_str = server_now_str[:-1] + '+00:00'
+                # Ragscallion may already append +00:00 to a Z-normalized string
+                if server_now_str.endswith('+00:00+00:00'):
+                    server_now_str = server_now_str[:-6]
                 last_check = datetime.fromisoformat(server_now_str)
             else:
                 # Fallback: use current time if server_now missing
@@ -177,6 +180,9 @@ async def _check_stale_nodes(manifest: Manifest) -> None:
         # Parse updated_at timestamp
         try:
             updated_at = datetime.fromisoformat(node.updated_at.replace('Z', '+00:00'))
+            # Ensure aware datetime for comparison
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
         except (ValueError, AttributeError):
             logger.warning(f"Node {node.device_id} has invalid updated_at: {node.updated_at}")
             continue

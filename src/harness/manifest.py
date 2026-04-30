@@ -61,9 +61,11 @@ STAGE_VALIDATE_PATCH = 6
 
 QUEUE_0_INITIAL = 0
 QUEUE_1_READY_FOR_PROCESSING = 1
+QUEUE_1_CANNOT_FIND_PDF = 1  # Alias: devices that fail Stage 1/2 land here
 QUEUE_2_POLLING_RAGSCALLION = 2
 QUEUE_3_READY_FOR_EXTRACTION = 3  # After Ragscallion indexing complete
 QUEUE_4_MANUAL_REVIEW = 4
+QUEUE_5_COMPLETED = 5  # Terminal: extraction succeeded, specs_json populated
 
 # Recovery action types
 RECOVERY_RESUME_STAGE = "resume"

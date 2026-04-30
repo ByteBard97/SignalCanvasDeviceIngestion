@@ -23,6 +23,9 @@ dependencies = [
     "lancedb>=0.1.0",
 ]
 
+[project.scripts]
+signalcanvas-ingest = "src.runner:main_cli"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
