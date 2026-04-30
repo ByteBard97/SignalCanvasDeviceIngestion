@@ -48,7 +48,8 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)    # Max 5 concurrent Stage 2 calls
 # Concurrency constants (no magic numbers)
 MAX_CONCURRENT_EXTRACTIONS = 5
 EXTRACTION_TIMEOUT_SECONDS = 360  # Consoles (e.g. CL5, SQ-5) need extra search time
-FIND_PDF_TIMEOUT_SECONDS = 60
+FIND_PDF_TIMEOUT_SECONDS = 120
+FIND_PDF_MAX_STEPS = 5  # tight budget; force fail-fast instead of broad exploration
 DOWNLOAD_TIMEOUT_SECONDS = 60
 
 
@@ -81,11 +82,16 @@ async def stage_1_find_pdf(
         repo_root = Path(__file__).resolve().parent.parent
         skills_dir = repo_root / ".claude" / "skills"
 
+        # Tight constrained prompt: one search, pick the best result, return immediately.
+        # Earlier versions let Kimi run an open-ended agentic search and it would burn
+        # 30 steps over 6 minutes without producing a final answer.
         prompt = (
-            f"Find the canonical manufacturer datasheet PDF URL for the device: "
-            f"{node.manufacturer} {node.model}. "
-            f"Return ONLY a JSON object with a single key 'pdf_url' containing the URL. "
-            f"No markdown, no explanations. Example: {{\"pdf_url\": \"https://example.com/datasheet.pdf\"}}"
+            f'Web search for the official manufacturer datasheet PDF URL of '
+            f'"{node.manufacturer} {node.model}". '
+            f'Do ONE web search, pick the best result that ends in .pdf, and reply '
+            f'with ONLY this JSON line: {{"pdf_url":"<url>"}}. '
+            f'If no PDF URL is in the search results, reply: {{"pdf_url":null}}. '
+            f'No commentary.'
         )
 
         try:
@@ -94,6 +100,7 @@ async def stage_1_find_pdf(
                 skills_dir=skills_dir,
                 work_dir=repo_root,
                 timeout=FIND_PDF_TIMEOUT_SECONDS,
+                max_steps=FIND_PDF_MAX_STEPS,
             )
         except Exception as e:
             logger.error(f"Device {node.device_id} Kimi invocation failed: {e}")

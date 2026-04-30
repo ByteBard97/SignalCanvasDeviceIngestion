@@ -19,6 +19,7 @@ async def run_kimi(
     skills_dir: Path,
     work_dir: Path,
     timeout: float = 180.0,
+    max_steps: int = 30,
 ) -> Optional[str]:
     """Invoke the Kimi CLI non-interactively and return its stdout.
 
@@ -27,6 +28,9 @@ async def run_kimi(
         skills_dir: Absolute path to the .claude/skills directory.
         work_dir: Absolute path to the repository root (for --add-dir).
         timeout: Maximum seconds to wait for Kimi to finish.
+        max_steps: Cap on agent loop iterations (--max-steps-per-turn).
+            Use a small value (3-5) for narrow look-up tasks like Stage 1
+            so Kimi fail-fasts instead of burning budget on exploration.
 
     Returns:
         Kimi's stdout as a string, or None on failure / timeout.
@@ -46,7 +50,7 @@ async def run_kimi(
         str(work_dir),
         "--afk",
         "--max-steps-per-turn",
-        "30",
+        str(max_steps),
     ]
 
     logger.debug("Running Kimi command: %s", " ".join(cmd))
