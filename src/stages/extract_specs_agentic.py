@@ -145,6 +145,39 @@ def _infer_connectors(extracted: dict) -> dict:
     return extracted
 
 
+def _build_peripheral_prompt(
+    manufacturer: str,
+    model: str,
+    chunks: list[dict],
+    existing_ports: list[dict],
+) -> str:
+    """Build a tiny focused prompt for extracting peripheral ports only."""
+    chunks_text = ""
+    for chunk in chunks:
+        source = chunk.get("source", "unknown")
+        section = chunk.get("section", "unknown")
+        text = chunk.get("text", "")
+        chunks_text += f"[{source}, {section}]\n{text}\n\n"
+
+    existing_names = [p.get("name", "") for p in existing_ports if isinstance(p, dict)]
+    existing_names_str = ", ".join(f'"{n}"' for n in existing_names) if existing_names else "none"
+
+    prompt = (
+        f"You are the SignalCanvas device-extraction agent. Extract ONLY peripheral "
+        f"ports for {manufacturer} {model} from the chunks below.\n\n"
+        f"Peripheral ports are small utility connectors such as: LAN/Ethernet, USB-B, "
+        f"USB-A/SQ-Drive, footswitch/foot-pedal, GPIO, or similar.\n\n"
+        f"Ports ALREADY extracted (do NOT duplicate these): {existing_names_str}\n\n"
+        f"Return JSON ONLY, no commentary, no markdown:\n"
+        f'{{ "ports": [{{"name","direction","connector","channels","attributes":[]}}] }}\n'
+        f"Use null for unknown fields. Do not invent specs. If no new peripheral ports "
+        f"are found, return {{\"ports\":[]}}.\n\n"
+        f"=== Chunks ===\n"
+        f"{chunks_text}"
+    )
+    return prompt
+
+
 def _build_prompt(
     manufacturer: str,
     model: str,
@@ -390,6 +423,118 @@ async def _requery_for_category(
 # ---------------------------------------------------------------------------
 
 
+async def _extract_peripheral_ports(
+    http: httpx.AsyncClient,
+    corpus_id: str,
+    existing_ports: list[dict],
+    manufacturer: str,
+    model: str,
+    moonshot: MoonshotClient,
+) -> list[dict]:
+    """Second-pass extraction focused on peripheral ports only.
+
+    Queries Ragscallion for a small set of generic peripheral-port queries,
+    builds a tiny focused prompt, and asks the LLM to extract only peripheral
+    ports not already present in *existing_ports*.
+    """
+    peripheral_queries = [
+        f"{manufacturer} {model} LAN Ethernet network RJ45 port connector",
+        f"{manufacturer} {model} USB type B port connector computer audio interface",
+        f"{manufacturer} {model} USB type A port connector storage recording playback",
+        f"{manufacturer} {model} footswitch foot pedal jack connector",
+    ]
+
+    # Gather chunks (limit 2 per query to keep total small)
+    all_chunks: list[dict] = []
+    for q in peripheral_queries:
+        try:
+            results = await search_ragscallion(http, corpus_id, q, limit=2)
+            all_chunks.extend(results)
+        except Exception as exc:
+            logger.warning(f"Peripheral RAG search failed for query '{q}': {exc}")
+
+    if not all_chunks:
+        return []
+
+    # Deduplicate and cap at 5 chunks
+    chunks = _dedupe_chunks(all_chunks)[:5]
+
+    prompt = _build_peripheral_prompt(manufacturer, model, chunks, existing_ports)
+    estimated = await moonshot.estimate_tokens(prompt)
+    tier = pick_tier(estimated)
+    logger.info(
+        f"{manufacturer} {model} (peripheral pass): estimated {estimated} tokens → tier {tier}"
+    )
+
+    try:
+        text, _usage = await moonshot.chat_completion(
+            prompt,
+            model=tier,
+            response_format_json=True,
+            temperature=EXTRACTION_TEMPERATURE,
+            seed=EXTRACTION_SEED,
+        )
+    except Exception as exc:
+        logger.warning(f"Peripheral pass LLM call failed for {manufacturer} {model}: {exc}")
+        return []
+
+    try:
+        parsed: dict = json.loads(text)
+        new_ports = parsed.get("ports", [])
+        if not isinstance(new_ports, list):
+            return []
+    except json.JSONDecodeError as exc:
+        logger.warning(f"Peripheral pass JSON decode failed for {manufacturer} {model}: {exc}")
+        return []
+
+    # Canonicalize messy connector strings from the LLM
+    _CONNECTOR_CANON: list[tuple[list[str], str]] = [
+        (["lan ethernet", "ethernet", "network", "rj45"], "RJ45"),
+        (["usb-b", "usb type b", "usb_b"], "USB-B"),
+        (["usb-a", "usb type a", "usb_a", "sq-drive"], "USB-A"),
+        (["foot", "pedal", "footswitch"], "TRS"),
+        (["xlr"], "XLR"),
+        (["trs", "1/4"], "TRS"),
+        (["usb"], "USB"),
+        (["gpio"], "Euroblock"),
+    ]
+
+    def _canonicalize_connector(conn: str | None, pname: str) -> str | None:
+        if not conn:
+            return None
+        c = conn.lower()
+        for keywords, canonical in _CONNECTOR_CANON:
+            if any(kw in c for kw in keywords):
+                return canonical
+        # Fallback: infer from port name
+        pl = pname.lower()
+        for keywords, canonical in _CONNECTOR_CANON:
+            if any(kw in pl for kw in keywords):
+                return canonical
+        return conn
+
+    # Filter out duplicates and known false positives
+    existing_names = {p.get("name", "").lower() for p in existing_ports if isinstance(p, dict)}
+    FALSE_POSITIVES = {"midi", "midi over usb", "midi i/o", "bluetooth", "wifi", "wi-fi"}
+    merged: list[dict] = []
+    for port in new_ports:
+        if not isinstance(port, dict):
+            continue
+        name = port.get("name", "")
+        if name.lower() in existing_names:
+            continue
+        if name.lower() in FALSE_POSITIVES:
+            continue
+        # Canonicalize connector regardless of whether it's null or messy
+        port["connector"] = _canonicalize_connector(port.get("connector"), name)
+        merged.append(port)
+
+    logger.info(
+        f"{manufacturer} {model} peripheral pass found {len(merged)} new port(s)"
+    )
+    return merged
+
+
 async def extract(
     manufacturer: str,
     model: str,
@@ -503,6 +648,23 @@ async def extract(
     except json.JSONDecodeError as exc:
         logger.warning(f"JSON decode failed for {manufacturer} {model}: {exc}")
         extracted = {"_raw_text": text, "_parse_error": str(exc)}
+
+    # 8b. Peripheral-port second pass (after normalization, before validation)
+    if isinstance(extracted, dict) and "_parse_error" not in extracted:
+        existing_ports = extracted.get("signal_flow", {}).get("ports", [])
+        if not isinstance(existing_ports, list):
+            existing_ports = []
+        try:
+            new_ports = await _extract_peripheral_ports(
+                http, corpus_id, existing_ports, manufacturer, model, moonshot
+            )
+            if new_ports:
+                extracted.setdefault("signal_flow", {}).setdefault("ports", []).extend(new_ports)
+                # Re-infer connectors on the merged result before re-normalizing
+                extracted = _infer_connectors(extracted)
+                extracted = normalize_extraction(extracted, classification.class_)
+        except Exception as exc:
+            logger.warning(f"Peripheral pass failed for {manufacturer} {model}: {exc}")
 
     # 9. Validator
     misses = _validate_extraction(extracted, classification.class_)

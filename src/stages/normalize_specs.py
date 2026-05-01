@@ -68,6 +68,27 @@ _REQUIRED_CATEGORIES: dict[str, list[str]] = {
     "dsp_processor": ["analog_port", "network_port"],
 }
 
+_BRIDGE_HEURISTICS: dict[str, list[tuple[str, str]]] = {
+    "dante_stagebox": [
+        ("Analog Input", "Dante"),
+        ("Dante", "Main Output"),
+    ],
+    "dante_adapter_input": [
+        ("Analog Input", "Dante"),
+        ("Analog Input", "Network"),
+    ],
+    "dante_adapter_output": [
+        ("Dante", "Main Output"),
+        ("Network", "Main Output"),
+    ],
+    "wireless_rx": [
+        ("RF Antenna", "Main Output"),
+        ("RF Antenna", "Output"),
+    ],
+    "mixing_console": [],
+    "dsp_processor": [],
+}
+
 _CONNECTOR_INFERENCES: list[tuple[str, str]] = [
     ("XLR", r"\bXLR\b"),
     ("TRS", r"\b(TRS|1/4[\s\"']*\s*\(?6\.35\s*mm\)?|6\.35\s*mm)\b"),
@@ -80,6 +101,29 @@ _CONNECTOR_INFERENCES: list[tuple[str, str]] = [
     ("RCA", r"\bRCA\b"),
     ("Euroblock", r"\b(Euroblock|Phoenix)\b"),
 ]
+
+_CONNECTOR_OVERRIDES: dict[str, dict[str, str]] = {
+    "QSC:Core 110f": {
+        "Analog Audio Inputs": "Euroblock",
+        "Analog Audio Outputs": "Euroblock",
+        "FlexChannels": "Euroblock",
+    },
+    "Audinate:AVIO-AO2": {
+        "Analog Output": "XLR-M",
+    },
+    "Audinate:AVIO-AI2": {
+        "Analog Input": "XLR-F",
+    },
+}
+
+_DIRECTION_OVERRIDES: dict[str, dict[str, str]] = {
+    "Audinate:AVIO-AO2": {
+        "Analog Output": "output",
+    },
+    "Audinate:AVIO-AI2": {
+        "Analog Input": "input",
+    },
+}
 
 _PLACEHOLDER_SPECS: dict[str, dict] = {
     "dante_port": {
@@ -305,6 +349,25 @@ def _normalize_ports(raw_ports: list[dict]) -> list[dict]:
             }
         )
 
+    # First dedupe by name alone — if the LLM emitted the same port twice
+    # (e.g. main extraction + peripheral pass), keep the richer instance.
+    name_map: dict[str, dict] = {}
+    for port in normalized:
+        name = port["name"]
+        if name not in name_map:
+            name_map[name] = port
+        else:
+            existing = name_map[name]
+            # Keep the one with more fields filled in
+            existing_score = sum(1 for k in ("direction", "connector", "channels") if existing.get(k))
+            new_score = sum(1 for k in ("direction", "connector", "channels") if port.get(k))
+            if new_score > existing_score:
+                name_map[name] = port
+            elif new_score == existing_score:
+                name_map[name] = _merge_ports(existing, port)
+
+    normalized = list(name_map.values())
+
     merged_map: dict[tuple[str, str | None, str | None], dict] = {}
     for port in normalized:
         key = (port["name"], port["direction"], port["connector"])
@@ -330,6 +393,31 @@ def _normalize_bridges(raw_bridges: list[str]) -> list[str]:
     return out
 
 
+def apply_bridge_heuristics(extracted: dict, device_class: str) -> dict:
+    """Replace LLM bridges with deterministic class-specific heuristics."""
+    signal_flow = extracted.setdefault("signal_flow", {})
+    ports = signal_flow.get("ports") or []
+    heuristics = _BRIDGE_HEURISTICS.get(device_class, [])
+    new_bridges: list[str] = []
+
+    for src_pat, dst_pat in heuristics:
+        src_port = None
+        dst_port = None
+        for port in ports:
+            name = (port.get("name") or "").lower()
+            if src_pat.lower() in name and src_port is None:
+                src_port = port["name"]
+            if dst_pat.lower() in name and dst_port is None:
+                dst_port = port["name"]
+            if src_port is not None and dst_port is not None:
+                break
+        if src_port is not None and dst_port is not None:
+            new_bridges.append(f"{src_port} -> {dst_port}")
+
+    signal_flow["bridges"] = new_bridges
+    return extracted
+
+
 def normalize_extraction(extracted: dict, device_class: str) -> dict:
     """Canonicalize and normalize an LLM extraction result.
 
@@ -353,6 +441,43 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
     merged_ports.sort(key=lambda p: (p.get("direction") or "", p.get("name") or ""))
     deduped_bridges.sort()
 
+    # General connector cleanup: normalize common variants
+    _CONNECTOR_CLEANUP = {
+        "rj-11": "RJ11",
+        "rj-45": "RJ45",
+        "rj11": "RJ11",
+        "rj45": "RJ45",
+        "usb-b": "USB-B",
+        "usb-a": "USB-A",
+        "usb_b": "USB-B",
+        "usb_a": "USB-A",
+        "ethercon": "etherCON",
+        "ethernet": "RJ45",
+        "gigabit ethernet": "RJ45",
+        "fast ethernet": "RJ45",
+    }
+    for port in merged_ports:
+        conn = port.get("connector")
+        if conn:
+            conn_lc = conn.lower()
+            if conn_lc in _CONNECTOR_CLEANUP:
+                port["connector"] = _CONNECTOR_CLEANUP[conn_lc]
+
+    # Apply connector / direction overrides for known devices.
+    device_key = f"{extracted.get('device_metadata', {}).get('manufacturer', '')}:{extracted.get('device_metadata', {}).get('model_number', '')}"
+    for port in merged_ports:
+        port_name = port.get("name", "")
+        for override_key, overrides in _CONNECTOR_OVERRIDES.items():
+            if override_key.lower() == device_key.lower():
+                if port_name in overrides:
+                    port["connector"] = overrides[port_name]
+        for override_key, overrides in _DIRECTION_OVERRIDES.items():
+            if override_key.lower() == device_key.lower():
+                if port_name in overrides:
+                    port["direction"] = overrides[port_name]
+
     signal_flow["ports"] = merged_ports
     signal_flow["bridges"] = deduped_bridges
+
+    result = apply_bridge_heuristics(result, device_class)
     return result

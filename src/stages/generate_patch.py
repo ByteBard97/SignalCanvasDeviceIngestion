@@ -126,10 +126,26 @@ def generate_patch(extracted: dict) -> str:
 
     if ports:
         lines.append("  ports {")
+        seen_names: dict[str, int] = {}
         for port in ports:
             if not isinstance(port, dict):
                 continue
-            lines.append(f"    {_build_port_line(port)}")
+            port_line = _build_port_line(port)
+            # Extract the sanitized name (first token before ':' or '[')
+            raw_name = _sanitize_identifier(port.get("name", "Port"))
+            # Detect duplicates and disambiguate by appending connector or counter
+            if raw_name in seen_names:
+                seen_names[raw_name] += 1
+                connector = port.get("connector")
+                if connector and _sanitize_identifier(connector) != raw_name:
+                    suffix = _sanitize_identifier(connector)
+                else:
+                    suffix = str(seen_names[raw_name])
+                # Rewrite the line with the disambiguated name
+                port_line = port_line.replace(raw_name, f"{raw_name}_{suffix}", 1)
+            else:
+                seen_names[raw_name] = 1
+            lines.append(f"    {port_line}")
         lines.append("  }")
 
     lines.extend(_build_bridge_lines(bridges, ports))
