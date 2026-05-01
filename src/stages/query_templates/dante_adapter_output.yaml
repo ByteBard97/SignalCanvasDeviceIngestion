@@ -1,0 +1,26 @@
+class: dante_adapter_output
+queries:
+  - q: "Dante input network RJ45 Ethernet channel count"
+    category: dante_port
+    limit: 5
+  - q: "analog output connector type XLR TRS RCA"
+    category: analog_port
+    limit: 5
+  - q: "output channel count stereo mono Dante to analog"
+    category: channel_count
+    limit: 5
+  - q: "output level line level headphone impedance"
+    category: analog_port
+    limit: 5
+  - q: "gain trim attenuation output sensitivity control"
+    category: analog_port
+    limit: 5
+  - q: "sample rate 48kHz 96kHz bit depth Dante"
+    category: clock
+    limit: 5
+  - q: "power supply PoE DC adapter voltage"
+    category: power
+    limit: 5
+  - q: "Dante latency low latency adapter converter"
+    category: latency
+    limit: 5

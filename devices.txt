@@ -3,3 +3,4 @@ AUDINATE|AVIO-AO2|audinate-avio-ao2
 SHURE|ULXD4|shure-ulxd4
 ALLEN_HEATH|SQ-5|allen-heath-sq5
 SENNHEISER|EW-DX-EM|sennheiser-ew-dx-em
+AUDINATE|AVIO-AI2|audinate-avio-ai2

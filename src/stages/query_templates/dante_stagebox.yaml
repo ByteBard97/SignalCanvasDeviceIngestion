@@ -1,0 +1,32 @@
+class: dante_stagebox
+queries:
+  - q: "Dante primary secondary network port redundancy"
+    category: dante_port
+    limit: 5
+  - q: "Dante RJ45 Ethernet connector redundant network"
+    category: dante_port
+    limit: 5
+  - q: "XLR analog input output channel count microphone line"
+    category: analog_port
+    limit: 5
+  - q: "sample rate 48kHz 96kHz Dante clock sync"
+    category: clock
+    limit: 5
+  - q: "Dante redundancy mode primary secondary failover"
+    category: dante_port
+    limit: 5
+  - q: "input output channel count Dante network audio"
+    category: channel_count
+    limit: 5
+  - q: "phantom power 48V mic preamp gain stage"
+    category: analog_port
+    limit: 5
+  - q: "Dante device latency milliseconds samples"
+    category: latency
+    limit: 5
+  - q: "word clock BNC input output sync"
+    category: clock
+    limit: 5
+  - q: "headphone monitor output level control"
+    category: analog_port
+    limit: 5

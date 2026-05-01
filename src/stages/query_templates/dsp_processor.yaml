@@ -1,0 +1,32 @@
+class: dsp_processor
+queries:
+  - q: "analog input output count connector type XLR TRS"
+    category: analog_port
+    limit: 5
+  - q: "AES3 digital input output channel count"
+    category: digital_port
+    limit: 5
+  - q: "Dante AES67 network audio channel count RJ45"
+    category: dante_port
+    limit: 5
+  - q: "USB audio interface host device port"
+    category: usb_port
+    limit: 5
+  - q: "GPIO contact closure input output count"
+    category: control_port
+    limit: 5
+  - q: "control network Ethernet TCP IP RS-232"
+    category: network_port
+    limit: 5
+  - q: "channel matrix routing mixer crosspoint count"
+    category: channel_count
+    limit: 5
+  - q: "DSP latency processing delay milliseconds samples"
+    category: latency
+    limit: 5
+  - q: "power consumption PoE DC voltage supply"
+    category: power
+    limit: 5
+  - q: "sample rate 48kHz 96kHz clock sync"
+    category: clock
+    limit: 5

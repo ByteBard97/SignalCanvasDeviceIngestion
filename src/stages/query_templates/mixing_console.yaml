@@ -1,0 +1,32 @@
+class: mixing_console
+queries:
+  - q: "input channel count mono stereo line"
+    category: channel_count
+    limit: 5
+  - q: "output bus count aux group matrix main"
+    category: channel_count
+    limit: 5
+  - q: "Dante card slot option module expansion"
+    category: dante_port
+    limit: 5
+  - q: "AES3 digital input output XLR connector"
+    category: digital_port
+    limit: 5
+  - q: "MADI optical coaxial input output channel count"
+    category: digital_port
+    limit: 5
+  - q: "microphone preamp gain phantom power 48V"
+    category: analog_port
+    limit: 5
+  - q: "USB audio interface multitrack recording playback"
+    category: usb_port
+    limit: 5
+  - q: "fader count motorized touch strip"
+    category: physical
+    limit: 5
+  - q: "network control port Ethernet remote app"
+    category: network_port
+    limit: 5
+  - q: "sample rate 48kHz 96kHz internal clock"
+    category: clock
+    limit: 5

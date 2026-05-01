@@ -3,7 +3,7 @@
 import json
 import sqlite3
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -275,6 +275,30 @@ class Manifest:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE device_nodes ADD COLUMN {col} {ddl}")
 
+            # Per-LLM-call token usage log. Append-only; one row per chat completion.
+            # Lets us roll up cost per device, per stage, or across the whole run
+            # without scraping log files.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS usage_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT,
+                    stage TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_tokens INTEGER NOT NULL,
+                    completion_tokens INTEGER NOT NULL,
+                    total_tokens INTEGER NOT NULL,
+                    elapsed_ms INTEGER,
+                    called_at TEXT NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_log_device ON usage_log(device_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_log_stage ON usage_log(stage)"
+            )
+
             conn.commit()
 
     def _recover_from_crash(self):
@@ -480,6 +504,61 @@ class Manifest:
         node.failure_attempts += 1
         node.failure_at = datetime.now().isoformat()
         self.persist(node)
+
+    def log_usage(
+        self,
+        *,
+        device_id: Optional[str],
+        stage: str,
+        provider: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        elapsed_ms: Optional[int] = None,
+    ) -> None:
+        """Append one chat-completion call's token usage to usage_log.
+
+        device_id may be None for non-device-scoped calls (e.g. ad-hoc evals).
+        stage is a free-form label like 'stage_5', 'stage_0_resolve_sku', 'bridge_inference'.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO usage_log (
+                    device_id, stage, provider, model,
+                    prompt_tokens, completion_tokens, total_tokens, elapsed_ms, called_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    device_id, stage, provider, model,
+                    int(prompt_tokens), int(completion_tokens), int(total_tokens),
+                    elapsed_ms, datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def usage_summary(self) -> dict:
+        """Roll up token totals across the usage_log. Cheap; uses indexes."""
+        with sqlite3.connect(self.db_path) as conn:
+            total_in, total_out, calls = conn.execute(
+                "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COUNT(*) FROM usage_log"
+            ).fetchone()
+            by_stage = {}
+            for row in conn.execute(
+                "SELECT stage, SUM(prompt_tokens), SUM(completion_tokens), COUNT(*) FROM usage_log GROUP BY stage"
+            ).fetchall():
+                by_stage[row[0]] = {
+                    "prompt_tokens": row[1] or 0,
+                    "completion_tokens": row[2] or 0,
+                    "calls": row[3],
+                }
+            return {
+                "total_prompt_tokens": total_in,
+                "total_completion_tokens": total_out,
+                "total_calls": calls,
+                "by_stage": by_stage,
+            }
 
     def stats(self) -> dict:
         """Return ingestion statistics."""

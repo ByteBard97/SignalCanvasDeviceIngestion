@@ -1,0 +1,17 @@
+class: generic
+queries:
+  - q: "power consumption voltage PoE"
+    category: power
+    limit: 3
+  - q: "physical dimensions weight rack"
+    category: physical
+    limit: 3
+  - q: "input output ports connectors XLR Dante Ethernet"
+    category: port
+    limit: 3
+  - q: "signal flow internal routing bridge bus"
+    category: routing
+    limit: 3
+  - q: "sample rate latency channels"
+    category: audio_spec
+    limit: 3

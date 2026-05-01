@@ -1,0 +1,32 @@
+class: wireless_rx
+queries:
+  - q: "RF frequency band range UHF VHF GHz MHz"
+    category: rf
+    limit: 5
+  - q: "antenna connector BNC SMA diversity remote"
+    category: antenna_port
+    limit: 5
+  - q: "audio output connector XLR TRS balanced unbalanced"
+    category: analog_port
+    limit: 5
+  - q: "networked control Ethernet Dante AES67 TCP IP"
+    category: network_port
+    limit: 5
+  - q: "squelch threshold noise gate RF sensitivity"
+    category: rf
+    limit: 5
+  - q: "channel count receiver channels simultaneous"
+    category: channel_count
+    limit: 5
+  - q: "power supply DC voltage adapter battery"
+    category: power
+    limit: 5
+  - q: "audio frequency response dynamic range THD"
+    category: audio_spec
+    limit: 5
+  - q: "USB port firmware update audio interface"
+    category: usb_port
+    limit: 5
+  - q: "rack mount half rack full rack size"
+    category: physical
+    limit: 5
