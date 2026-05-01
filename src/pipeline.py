@@ -297,6 +297,8 @@ class DeviceIngestionPipeline:
         Failure Categories:
         - PATCH_GENERATION_FAILED: Agent couldn't generate valid PatchLang (retryable)
         """
+        import json
+
         device_id = state.execution_state.current_device_id
         node = self.manifest.get_node(device_id)
 
@@ -304,9 +306,12 @@ class DeviceIngestionPipeline:
 
         patch_source = None
         try:
-            # TODO: Implement PatchBuilder integration
-            # patch_source = await generate_patch_from_specs(node.specs_json)
-            pass
+            from stages.generate_patch import generate_patch
+
+            specs = node.specs_json
+            if isinstance(specs, str):
+                specs = json.loads(specs)
+            patch_source = generate_patch(specs)
         except Exception as e:
             logger.error(f"Stage 6 generation error for {device_id}: {e}")
 
@@ -346,22 +351,22 @@ class DeviceIngestionPipeline:
 
         logger.info(f"[Stage 7] Validating .patch for {device_id}")
 
-        validation_error = None
+        is_valid = False
+        validation_errors: list[str] = []
         try:
-            # TODO: Implement patchlang_python.check()
-            # validation_result = await patchlang_check(node.patch_source)
-            # if not validation_result.is_valid:
-            #     raise PatchlangError(validation_result.diagnostics)
-            pass
+            from stages.validate_patch import validate_patch
+
+            is_valid, validation_errors = validate_patch(node.patch_source)
         except Exception as e:
-            validation_error = str(e)
+            validation_errors = [str(e)]
             logger.error(f"Stage 7 validation error for {device_id}: {e}")
 
-        if validation_error:
+        if not is_valid:
             # Validation failed: record failure and move to manual review
+            error_msg = "; ".join(validation_errors) if validation_errors else "Patch validation failed"
             node.failure_stage = STAGE_VALIDATE_PATCH
             node.failure_category = FailureCategory.PATCH_VALIDATION_FAILED.value
-            node.failure_message = f"Patch validation error: {validation_error[:200]}"
+            node.failure_message = f"Patch validation error: {error_msg[:200]}"
             node.failure_retryable = False  # Generation logic needs fixing
             node.failure_attempts += 1
             node.failure_at = datetime.now(timezone.utc).isoformat()

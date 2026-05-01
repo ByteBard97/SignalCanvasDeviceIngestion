@@ -23,6 +23,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from moonshot_client import MoonshotClient, UsageRecord  # noqa: E402
 from stages._ragscallion import search_ragscallion  # noqa: E402
 from stages.classify_device import classify, Classification  # noqa: E402
+from stages.normalize_specs import normalize_extraction  # noqa: E402
 from stages.sku_aliases import get_registry, AliasEntry  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,45 @@ class ExtractionTrace:
 # ---------------------------------------------------------------------------
 
 
+def _infer_connectors(extracted: dict) -> dict:
+    """Fill null connectors based on port name keywords."""
+    ports = extracted.get("signal_flow", {}).get("ports", [])
+    if not isinstance(ports, list):
+        return extracted
+
+    mapping = [
+        (["xlr"], "XLR"),
+        (["trs", "1/4", '1/4"', "6.35mm", "quarter-inch", "phone jack"], "TRS"),
+        (["rj45", "ethercon", "ethernet", "dante", "network", "lan", "voip", "gigabit"], "RJ45"),
+        (["usb"], "USB"),
+        (["sma"], "SMA"),
+        (["bnc"], "BNC"),
+        (["lemo"], "LEMO"),
+        (["hdmi"], "HDMI"),
+        (["rca", "phono"], "RCA"),
+        (["euroblock", "phoenix", "terminal block", "combicon", "pluggable terminal"], "Euroblock"),
+        (["rj11", "rj-11", "pots"], "RJ11"),
+        (["3.5mm", "1/8", "minijack", "mini jack"], "3.5mm"),
+        (["aes3", "aes"], "XLR"),
+        (["madi"], "BNC"),
+        (["gpi", "gpo", "gpio"], "Euroblock"),
+    ]
+
+    for port in ports:
+        if not isinstance(port, dict):
+            continue
+        connector = port.get("connector")
+        if connector is not None and connector != "":
+            continue
+        name = (port.get("name") or "").lower()
+        for keywords, ctype in mapping:
+            if any(kw in name for kw in keywords):
+                port["connector"] = ctype
+                break
+
+    return extracted
+
+
 def _build_prompt(
     manufacturer: str,
     model: str,
@@ -139,6 +179,7 @@ def _build_prompt(
         f'  "extraction_confidence": "high|medium|low",\n'
         f'  "notes": "..."\n'
         f"}}\n\n"
+        f"Connector canonicalization rules: If a port uses XLR, TRS, RJ45, USB, SMA, BNC, LEMO, HDMI, RCA, or Euroblock connectors, you MUST specify the connector type. Do not leave connector as null when the connector type is obvious from the port name or surrounding context.\n\n"
         f"Use null for unknown fields. Do not invent specs.\n\n"
         f"=== Chunks ===\n"
         f"{chunks_text}"
@@ -457,6 +498,8 @@ async def extract(
     # 8. Parse JSON
     try:
         extracted: dict = json.loads(text)
+        extracted = _infer_connectors(extracted)
+        extracted = normalize_extraction(extracted, classification.class_)
     except json.JSONDecodeError as exc:
         logger.warning(f"JSON decode failed for {manufacturer} {model}: {exc}")
         extracted = {"_raw_text": text, "_parse_error": str(exc)}
@@ -515,6 +558,8 @@ async def extract(
             trace.usage = usage
             try:
                 extracted = json.loads(text)
+                extracted = _infer_connectors(extracted)
+                extracted = normalize_extraction(extracted, classification.class_)
             except json.JSONDecodeError as exc:
                 logger.warning(f"JSON decode failed on retry for {manufacturer} {model}: {exc}")
                 extracted = {"_raw_text": text, "_parse_error": str(exc)}

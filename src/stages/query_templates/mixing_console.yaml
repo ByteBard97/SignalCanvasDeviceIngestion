@@ -33,18 +33,21 @@ queries:
   - q: "headphone monitor output 1/4 inch TRS jack"
     category: monitor_port
     limit: 5
-  - q: "main outputs XLR analog left right stereo"
+  - q: "main outputs XLR analog left right stereo 12 channel"
     category: main_output
-    limit: 5
+    limit: 3
   - q: "LAN Ethernet network control RJ45 port"
     category: network_port
-    limit: 5
-  - q: "USB type A storage recording playback"
+    limit: 3
+  - q: "USB type B port computer audio interface"
     category: usb_port
-    limit: 5
+    limit: 3
+  - q: "USB type A storage recording playback SQ-Drive"
+    category: usb_port
+    limit: 3
   - q: "footswitch GPIO foot pedal expression jack"
     category: gpio_port
-    limit: 5
+    limit: 3
   - q: "sample rate 48kHz 96kHz internal clock"
     category: clock
     limit: 5

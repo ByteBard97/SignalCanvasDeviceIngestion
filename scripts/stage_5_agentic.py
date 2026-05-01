@@ -31,6 +31,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from harness.manifest import Manifest  # noqa: E402
 from moonshot_client import MoonshotClient, UsageRecord  # noqa: E402
 from stages.extract_specs_agentic import extract, ExtractionTrace  # noqa: E402
+from stages.normalize_specs import normalize_extraction  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Pricing constants (USD per million tokens) — Moonshot official pricing
@@ -168,6 +169,14 @@ async def _process_one_device(
                 json_valid=False,
                 error=f"Extraction error: {e}",
             )
+
+        # Normalize extraction before serializing
+        if (
+            isinstance(extracted, dict)
+            and "_parse_error" not in extracted
+            and trace.classification is not None
+        ):
+            extracted = normalize_extraction(extracted, trace.classification.class_)
 
         # Serialize extracted dict
         text = json.dumps(extracted, indent=2, ensure_ascii=False)

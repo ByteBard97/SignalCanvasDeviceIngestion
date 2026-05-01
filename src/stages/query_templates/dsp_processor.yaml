@@ -1,21 +1,36 @@
 class: dsp_processor
 queries:
-  - q: "analog input output count connector type XLR TRS"
+  - q: "analog input output count connector type XLR TRS balanced Euroblock Phoenix"
     category: analog_port
     limit: 5
-  - q: "AES3 digital input output channel count"
+  - q: "AES3 digital input output channel count XLR connector"
     category: digital_port
     limit: 5
-  - q: "Dante AES67 network audio channel count RJ45"
+  - q: "Dante AES67 network audio channel count RJ45 Ethernet"
     category: dante_port
     limit: 5
-  - q: "USB audio interface host device port"
+  - q: "USB audio interface host device port type B"
     category: usb_port
     limit: 5
-  - q: "GPIO contact closure input output count"
+  - q: "VoIP SIP phone RJ45 network interface"
+    category: network_port
+    limit: 5
+  - q: "POTS telephone RJ11 analog phone line"
+    category: analog_port
+    limit: 5
+  - q: "GPI contact closure input terminal block"
     category: control_port
     limit: 5
-  - q: "control network Ethernet TCP IP RS-232"
+  - q: "GPO contact closure output relay terminal block"
+    category: control_port
+    limit: 5
+  - q: "RS232 serial port DB9 control"
+    category: control_port
+    limit: 5
+  - q: "Euroblock connector GPIO logic input output"
+    category: control_port
+    limit: 5
+  - q: "network Ethernet control TCP IP port RJ45"
     category: network_port
     limit: 5
   - q: "channel matrix routing mixer crosspoint count"
