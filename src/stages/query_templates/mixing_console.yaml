@@ -27,6 +27,24 @@ queries:
   - q: "network control port Ethernet remote app"
     category: network_port
     limit: 5
+  - q: "talkback microphone XLR input connector"
+    category: talkback_port
+    limit: 5
+  - q: "headphone monitor output 1/4 inch TRS jack"
+    category: monitor_port
+    limit: 5
+  - q: "main outputs XLR analog left right stereo"
+    category: main_output
+    limit: 5
+  - q: "LAN Ethernet network control RJ45 port"
+    category: network_port
+    limit: 5
+  - q: "USB type A storage recording playback"
+    category: usb_port
+    limit: 5
+  - q: "footswitch GPIO foot pedal expression jack"
+    category: gpio_port
+    limit: 5
   - q: "sample rate 48kHz 96kHz internal clock"
     category: clock
     limit: 5

@@ -37,7 +37,7 @@ MAX_RETRIES = 1
 PROMPT_CHAR_BUDGET = 6000
 PER_DEVICE_TIMEOUT_SECONDS = 120
 MODEL_FILTER_MIN_CHUNKS = 8
-MAX_CHUNKS_PER_PROMPT = 20
+MAX_CHUNKS_PER_PROMPT = 40
 
 # Required port categories per class (for validator)
 REQUIRED_CATEGORIES: dict[str, list[str]] = {
@@ -338,12 +338,28 @@ async def extract(
     trace.model_filter_floor_triggered = floor_triggered
     chunks_to_use = filtered if filtered and not floor_triggered else all_chunks
 
-    # 6b. Hard chunk cap to stay inside the 8K model token limit
+    # 6b. Priority-based chunk cap to stay inside the 8K model token limit.
+    # Order: model-matching chunks > pass-1 (type-specific) > pass-2 (generic)
+    # so peripheral pages (often surfaced by pass-2) aren't silently dropped.
     if len(chunks_to_use) > MAX_CHUNKS_PER_PROMPT:
+        model_token = model.lower()
+        pass1_keys = {_chunk_key(c) for c in pass1_chunks}
+
+        def _priority(chunk: dict) -> int:
+            key = _chunk_key(chunk)
+            text = chunk.get("text", "").lower()
+            if model_token in text:
+                return 0  # highest — keep all model-matching chunks
+            if key in pass1_keys:
+                return 1  # medium — pass-1 type-specific
+            return 2  # lowest — pass-2 generic safety net
+
+        chunks_to_use = sorted(chunks_to_use, key=_priority)
+        dropped = len(chunks_to_use) - MAX_CHUNKS_PER_PROMPT
         logger.warning(
             f"Chunk count {len(chunks_to_use)} exceeds MAX_CHUNKS_PER_PROMPT "
-            f"({MAX_CHUNKS_PER_PROMPT}) for {model}; truncating to first "
-            f"{MAX_CHUNKS_PER_PROMPT} chunks."
+            f"({MAX_CHUNKS_PER_PROMPT}) for {model}; dropping {dropped} "
+            f"lowest-priority chunks."
         )
         chunks_to_use = chunks_to_use[:MAX_CHUNKS_PER_PROMPT]
     trace.effective_chunk_count = len(chunks_to_use)
@@ -383,6 +399,19 @@ async def extract(
             trace.model_filter_floor_triggered = floor_triggered
             chunks_to_use = filtered if filtered and not floor_triggered else all_chunks
             if len(chunks_to_use) > MAX_CHUNKS_PER_PROMPT:
+                model_token = model.lower()
+                pass1_keys = {_chunk_key(c) for c in pass1_chunks}
+
+                def _retry_priority(chunk: dict) -> int:
+                    key = _chunk_key(chunk)
+                    text = chunk.get("text", "").lower()
+                    if model_token in text:
+                        return 0
+                    if key in pass1_keys:
+                        return 1
+                    return 2
+
+                chunks_to_use = sorted(chunks_to_use, key=_retry_priority)
                 chunks_to_use = chunks_to_use[:MAX_CHUNKS_PER_PROMPT]
             trace.model_filtered_chunk_count = len(filtered)
             trace.effective_chunk_count = len(chunks_to_use)
