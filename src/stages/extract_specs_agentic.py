@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +24,11 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from moonshot_client import MoonshotClient, UsageRecord  # noqa: E402
 from stages._ragscallion import search_ragscallion  # noqa: E402
 from stages.classify_device import classify, Classification  # noqa: E402
-from stages.normalize_specs import normalize_extraction  # noqa: E402
+from stages.normalize_specs import (
+    normalize_extraction,
+    _canonicalize_name,
+    _normalize_bridge,
+)  # noqa: E402
 from stages.sku_aliases import get_registry, AliasEntry  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -45,8 +50,8 @@ EXTRACTION_SEED = 42
 # Auto-routing tiers, ordered cheapest → largest. Each entry maps a Moonshot
 # model to the maximum input-token count we'll send under the OUTPUT_BUDGET.
 TIER_INPUT_LIMITS = [
-    ("moonshot-v1-8k",   7500),
-    ("moonshot-v1-32k",  30000),
+    ("moonshot-v1-8k", 7500),
+    ("moonshot-v1-32k", 30000),
     ("moonshot-v1-128k", 120000),
 ]
 OUTPUT_BUDGET_TOKENS = 700
@@ -59,9 +64,9 @@ def pick_tier(estimated_input_tokens: int) -> str:
         if needed <= limit:
             return model
     raise RuntimeError(
-        f"Prompt too large even for largest tier: {needed} tokens "
-        f"(limits: {TIER_INPUT_LIMITS})"
+        f"Prompt too large even for largest tier: {needed} tokens " f"(limits: {TIER_INPUT_LIMITS})"
     )
+
 
 # Required port categories per class (for validator)
 REQUIRED_CATEGORIES: dict[str, list[str]] = {
@@ -99,6 +104,10 @@ class ExtractionTrace:
     disambiguation_applied: bool = False
     estimated_input_tokens: int = 0
     model_tier: str = ""
+    pass_a_tokens: int = 0
+    pass_b_tokens: int = 0
+    pass_a_tier: str = ""
+    pass_b_tier: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -171,53 +180,122 @@ def _build_peripheral_prompt(
         f"Return JSON ONLY, no commentary, no markdown:\n"
         f'{{ "ports": [{{"name","direction","connector","channels","attributes":[]}}] }}\n'
         f"Use null for unknown fields. Do not invent specs. If no new peripheral ports "
-        f"are found, return {{\"ports\":[]}}.\n\n"
+        f'are found, return {{"ports":[]}}.\n\n'
         f"=== Chunks ===\n"
         f"{chunks_text}"
     )
     return prompt
 
 
-def _build_prompt(
+def _format_chunks(chunks: list[dict]) -> str:
+    """Format chunk list into prompt text."""
+    parts: list[str] = []
+    for chunk in chunks:
+        source = chunk.get("source", "unknown")
+        section = chunk.get("section", "unknown")
+        text = chunk.get("text", "")
+        parts.append(f"[{source}, {section}]\n{text}")
+    return "\n\n".join(parts)
+
+
+def _build_ports_prompt(
     manufacturer: str,
     model: str,
     chunks: list[dict],
     disambiguation: Optional[str] = None,
 ) -> str:
-    """Build the single-shot extraction prompt."""
-    chunks_text = ""
-    for chunk in chunks:
-        source = chunk.get("source", "unknown")
-        section = chunk.get("section", "unknown")
-        text = chunk.get("text", "")
-        chunks_text += f"[{source}, {section}]\n{text}\n\n"
-
+    """Build Pass A prompt: ports and bridges only."""
+    chunks_text = _format_chunks(chunks)
     disambiguation_section = ""
     if disambiguation:
-        disambiguation_section = (
-            f"DEVICE DISAMBIGUATION (READ CAREFULLY):\n"
-            f"{disambiguation}\n\n"
-        )
-
-    prompt = (
-        f"You are the SignalCanvas device-extraction agent. Extract a structured "
-        f"device template for {manufacturer} {model} from the chunks below.\n\n"
+        disambiguation_section = f"DEVICE DISAMBIGUATION (READ CAREFULLY):\n{disambiguation}\n\n"
+    return (
+        f"You are the SignalCanvas device-extraction agent. Extract ONLY the physical "
+        f"connectors and signal-flow bridges for {manufacturer} {model} from the chunks below.\n\n"
         f"{disambiguation_section}"
-        f"Required output: JSON only, matching this schema (no commentary, no markdown):\n"
-        f"{{\n"
-        f'  "device_metadata": {{ "manufacturer", "model_number", "label", "device_type", "category" }},\n'
-        f'  "signal_flow": {{ "ports": [{{"name","direction","connector","channels","attributes":[]}}], "bridges": ["from->to", ...] }},\n'
-        f'  "power_specs": {{ "power_draw_w", "voltage", "thermal_btuh", "poe_budget_w", "poe_draw_w" }},\n'
-        f'  "physical_specs": {{ "height_mm", "width_mm", "depth_mm", "weight_kg" }},\n'
-        f'  "extraction_confidence": "high|medium|low",\n'
-        f'  "notes": "..."\n'
-        f"}}\n\n"
-        f"Connector canonicalization rules: If a port uses XLR, TRS, RJ45, USB, SMA, BNC, LEMO, HDMI, RCA, or Euroblock connectors, you MUST specify the connector type. Do not leave connector as null when the connector type is obvious from the port name or surrounding context.\n\n"
+        f"List EVERY physical connector on this device. Do not omit any port.\n\n"
+        f"Return JSON ONLY, no commentary, no markdown:\n"
+        f'{{ "signal_flow": {{ "ports": [{{"name","direction","connector","channels","attributes":[]}}], '
+        f'"bridges": ["from->to"] }} }}\n\n'
+        f"Connector canonicalization rules: If a port uses XLR, TRS, RJ45, USB, SMA, "
+        f"BNC, LEMO, HDMI, RCA, or Euroblock connectors, you MUST specify the connector type. "
+        f"Do not leave connector as null when the connector type is obvious from the port name "
+        f"or surrounding context.\n\n"
         f"Use null for unknown fields. Do not invent specs.\n\n"
         f"=== Chunks ===\n"
         f"{chunks_text}"
     )
-    return prompt
+
+
+def _build_metadata_prompt(
+    manufacturer: str,
+    model: str,
+    chunks: list[dict],
+    disambiguation: Optional[str] = None,
+) -> str:
+    """Build Pass B prompt: metadata, physical specs, power, confidence, notes."""
+    chunks_text = _format_chunks(chunks)
+    disambiguation_section = ""
+    if disambiguation:
+        disambiguation_section = f"DEVICE DISAMBIGUATION (READ CAREFULLY):\n{disambiguation}\n\n"
+    return (
+        f"You are the SignalCanvas device-extraction agent. Extract metadata, physical specs, "
+        f"power specs, and confidence for {manufacturer} {model} from the chunks below.\n\n"
+        f"{disambiguation_section}"
+        f"Return JSON ONLY, no commentary, no markdown:\n"
+        f"{{\n"
+        f'  "device_metadata": {{ "manufacturer", "model_number", "label", "device_type", "category" }},\n'
+        f'  "physical_specs": {{ "height_mm", "width_mm", "depth_mm", "weight_kg" }},\n'
+        f'  "power_specs": {{ "power_draw_w", "voltage", "thermal_btuh", "poe_budget_w", "poe_draw_w" }},\n'
+        f'  "extraction_confidence": "high|medium|low",\n'
+        f'  "notes": "..."\n'
+        f"}}\n\n"
+        f"Use null for unknown fields. Do not invent specs.\n\n"
+        f"=== Chunks ===\n"
+        f"{chunks_text}"
+    )
+
+
+def _merge_passes(ports_result: dict, metadata_result: dict) -> dict:
+    """Merge Pass A and Pass B results. Ports dict wins on signal_flow."""
+    merged = dict(metadata_result)
+    if "signal_flow" in ports_result:
+        merged["signal_flow"] = ports_result["signal_flow"]
+    return merged
+
+
+def _aggregate_usage(a: UsageRecord, b: UsageRecord) -> UsageRecord:
+    """Sum two UsageRecords."""
+    return UsageRecord(
+        model=f"{a.model}+{b.model}",
+        prompt_tokens=a.prompt_tokens + b.prompt_tokens,
+        completion_tokens=a.completion_tokens + b.completion_tokens,
+        total_tokens=a.total_tokens + b.total_tokens,
+        elapsed_ms=a.elapsed_ms + b.elapsed_ms,
+    )
+
+
+async def _run_llm_pass(
+    prompt: str,
+    moonshot: MoonshotClient,
+    max_tokens: Optional[int] = None,
+) -> tuple[dict, str, int, str, UsageRecord]:
+    """Run a single LLM pass and return (parsed, raw_text, estimated_tokens, tier, usage)."""
+    estimated = await moonshot.estimate_tokens(prompt)
+    tier = pick_tier(estimated)
+    text, usage = await moonshot.chat_completion(
+        prompt,
+        model=tier,
+        response_format_json=True,
+        temperature=EXTRACTION_TEMPERATURE,
+        seed=EXTRACTION_SEED,
+        max_tokens=max_tokens,
+    )
+    try:
+        parsed: dict = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = {}
+    return parsed, text, estimated, tier, usage
 
 
 # ---------------------------------------------------------------------------
@@ -529,9 +607,7 @@ async def _extract_peripheral_ports(
         port["connector"] = _canonicalize_connector(port.get("connector"), name)
         merged.append(port)
 
-    logger.info(
-        f"{manufacturer} {model} peripheral pass found {len(merged)} new port(s)"
-    )
+    logger.info(f"{manufacturer} {model} peripheral pass found {len(merged)} new port(s)")
     return merged
 
 
@@ -622,32 +698,35 @@ async def extract(
         ),
     )
 
-    # 8. Build prompt, estimate tokens, pick tier, call Moonshot
-    prompt = _build_prompt(manufacturer, model, chunks_to_use, disambiguation)
-    estimated = await moonshot.estimate_tokens(prompt)
-    trace.estimated_input_tokens = estimated
-    tier = pick_tier(estimated)
-    trace.model_tier = tier
-    logger.info(
-        f"{manufacturer} {model}: estimated {estimated} tokens → tier {tier}"
+    # 8. Run Pass A (ports) and Pass B (metadata)
+    prompt_a = _build_ports_prompt(manufacturer, model, chunks_to_use, disambiguation)
+    extracted_ports, text_a, est_a, tier_a, usage_a = await _run_llm_pass(
+        prompt_a, moonshot, max_tokens=1200
     )
-    text, usage = await moonshot.chat_completion(
-        prompt,
-        model=tier,
-        response_format_json=True,
-        temperature=EXTRACTION_TEMPERATURE,
-        seed=EXTRACTION_SEED,
-    )
-    trace.usage = usage
+    trace.pass_a_tokens = est_a
+    trace.pass_a_tier = tier_a
+    logger.info(f"{manufacturer} {model} (ports pass): estimated {est_a} tokens → tier {tier_a}")
 
-    # 8. Parse JSON
-    try:
-        extracted: dict = json.loads(text)
+    prompt_b = _build_metadata_prompt(manufacturer, model, chunks_to_use, disambiguation)
+    extracted_metadata, text_b, est_b, tier_b, usage_b = await _run_llm_pass(prompt_b, moonshot)
+    trace.pass_b_tokens = est_b
+    trace.pass_b_tier = tier_b
+    trace.estimated_input_tokens = est_a + est_b
+    trace.model_tier = f"{tier_a}+{tier_b}"
+    trace.usage = _aggregate_usage(usage_a, usage_b)
+    logger.info(f"{manufacturer} {model} (metadata pass): estimated {est_b} tokens → tier {tier_b}")
+
+    # Parse and merge
+    if not extracted_ports and not extracted_metadata:
+        extracted: dict = {
+            "_raw_text_a": text_a,
+            "_raw_text_b": text_b,
+            "_parse_error": "Both passes failed JSON decode",
+        }
+    else:
+        extracted = _merge_passes(extracted_ports, extracted_metadata)
         extracted = _infer_connectors(extracted)
         extracted = normalize_extraction(extracted, classification.class_)
-    except json.JSONDecodeError as exc:
-        logger.warning(f"JSON decode failed for {manufacturer} {model}: {exc}")
-        extracted = {"_raw_text": text, "_parse_error": str(exc)}
 
     # 8b. Peripheral-port second pass (after normalization, before validation)
     if isinstance(extracted, dict) and "_parse_error" not in extracted:
@@ -673,11 +752,8 @@ async def extract(
     # 10. Retry (max 1)
     if misses and trace.retries < MAX_RETRIES:
         trace.retries += 1
-        # Re-query for the first missing category
         target = misses[0]
-        extra_chunks = await _requery_for_category(
-            http, corpus_id, target, manufacturer, model
-        )
+        extra_chunks = await _requery_for_category(http, corpus_id, target, manufacturer, model)
         if extra_chunks:
             all_chunks = _dedupe_chunks(all_chunks + extra_chunks)
             filtered, floor_triggered = _filter_by_model_token(all_chunks, model, aliases)
@@ -702,31 +778,259 @@ async def extract(
             trace.model_filtered_chunk_count = len(filtered)
             trace.effective_chunk_count = len(chunks_to_use)
 
-            prompt = _build_prompt(manufacturer, model, chunks_to_use, disambiguation)
-            estimated_retry = await moonshot.estimate_tokens(prompt)
-            trace.estimated_input_tokens = estimated_retry
-            tier_retry = pick_tier(estimated_retry)
-            trace.model_tier = tier_retry
-            logger.info(
-                f"{manufacturer} {model} (retry): estimated {estimated_retry} tokens → tier {tier_retry}"
+            prompt_a = _build_ports_prompt(manufacturer, model, chunks_to_use, disambiguation)
+            extracted_ports, text_a, est_a, tier_a, usage_a = await _run_llm_pass(
+                prompt_a, moonshot, max_tokens=1200
             )
-            text, usage = await moonshot.chat_completion(
-                prompt,
-                model=tier_retry,
-                response_format_json=True,
-                temperature=EXTRACTION_TEMPERATURE,
-                seed=EXTRACTION_SEED,
+            trace.pass_a_tokens = est_a
+            trace.pass_a_tier = tier_a
+
+            prompt_b = _build_metadata_prompt(manufacturer, model, chunks_to_use, disambiguation)
+            extracted_metadata, text_b, est_b, tier_b, usage_b = await _run_llm_pass(
+                prompt_b, moonshot
             )
-            trace.usage = usage
-            try:
-                extracted = json.loads(text)
+            trace.pass_b_tokens = est_b
+            trace.pass_b_tier = tier_b
+            trace.estimated_input_tokens = est_a + est_b
+            trace.model_tier = f"{tier_a}+{tier_b}"
+            trace.usage = _aggregate_usage(usage_a, usage_b)
+            logger.info(f"{manufacturer} {model} (retry): ports={tier_a} meta={tier_b}")
+
+            if not extracted_ports and not extracted_metadata:
+                extracted = {
+                    "_raw_text_a": text_a,
+                    "_raw_text_b": text_b,
+                    "_parse_error": "Both passes failed JSON decode on retry",
+                }
+            else:
+                extracted = _merge_passes(extracted_ports, extracted_metadata)
                 extracted = _infer_connectors(extracted)
                 extracted = normalize_extraction(extracted, classification.class_)
-            except json.JSONDecodeError as exc:
-                logger.warning(f"JSON decode failed on retry for {manufacturer} {model}: {exc}")
-                extracted = {"_raw_text": text, "_parse_error": str(exc)}
 
             misses = _validate_extraction(extracted, classification.class_)
             trace.validator_misses = misses
 
     return extracted, trace
+
+
+# ---------------------------------------------------------------------------
+# N-shot majority-voting wrapper
+# ---------------------------------------------------------------------------
+
+
+def _port_richness(port: dict) -> int:
+    """Score a port by how many key fields are filled."""
+    return sum(
+        1
+        for k in ("direction", "connector", "channels")
+        if port.get(k) is not None and port.get(k) != ""
+    )
+
+
+async def extract_n_shot(
+    http: httpx.AsyncClient,
+    corpus_id: str,
+    manufacturer: str,
+    model: str,
+    moonshot: MoonshotClient,
+    n: int = 3,
+) -> tuple[dict, ExtractionTrace]:
+    """Run extraction N times and merge results via majority voting.
+
+    Port merge strategy:
+      - Union of all ports across runs, deduplicated by canonical name.
+      - If the same canonical name appears in multiple runs, keep the
+        "richest" version (most fields filled: direction, connector, channels).
+
+    Bridge merge strategy:
+      - Normalize each bridge string.
+      - Keep bridges that appear in >= ceil(N/2) runs (majority vote).
+
+    Metadata / physical_specs / power_specs:
+      - Taken from the first successful run.
+
+    Trace aggregation:
+      - estimated_input_tokens = sum across runs
+      - usage = sum across runs (new UsageRecord)
+      - retries = max across runs
+    """
+    if n <= 1:
+        return await extract(manufacturer, model, corpus_id, http, moonshot)
+
+    sem = asyncio.Semaphore(2)
+
+    async def _one() -> tuple[dict, ExtractionTrace]:
+        async with sem:
+            return await extract(manufacturer, model, corpus_id, http, moonshot)
+
+    results: list[tuple[dict, ExtractionTrace]] = []
+    for _ in range(n):
+        extracted, trace = await _one()
+        results.append((extracted, trace))
+
+    # Filter to successful runs (dict without parse error)
+    successful = [
+        (ext, tr) for ext, tr in results if isinstance(ext, dict) and "_parse_error" not in ext
+    ]
+
+    if not successful:
+        # All failed — return first failure
+        return results[0]
+
+    first_ext, first_trace = successful[0]
+
+    # ------------------------------------------------------------------
+    # Merge ports: union by canonical name, keep richest
+    # ------------------------------------------------------------------
+    port_map: dict[str, dict] = {}
+    for ext, _tr in successful:
+        ports = ext.get("signal_flow", {}).get("ports", [])
+        if not isinstance(ports, list):
+            continue
+        for port in ports:
+            if not isinstance(port, dict):
+                continue
+            name = port.get("name")
+            if not name:
+                continue
+            canonical = _canonicalize_name(name)
+            if canonical not in port_map:
+                port_map[canonical] = dict(port)
+            else:
+                existing = port_map[canonical]
+                if _port_richness(port) > _port_richness(existing):
+                    port_map[canonical] = dict(port)
+                elif _port_richness(port) == _port_richness(existing):
+                    # Merge attributes if richness is equal
+                    attrs = set(existing.get("attributes") or [])
+                    attrs.update(port.get("attributes") or [])
+                    merged = dict(existing)
+                    merged["attributes"] = sorted(attrs) if attrs else None
+                    # Take any non-null field from port if existing is null
+                    for k in ("direction", "connector", "channels"):
+                        if merged.get(k) is None and port.get(k) is not None:
+                            merged[k] = port[k]
+                    port_map[canonical] = merged
+
+    merged_ports = list(port_map.values())
+
+    # ------------------------------------------------------------------
+    # Merge bridges: majority vote
+    # ------------------------------------------------------------------
+    bridge_counts: dict[str, int] = {}
+    for ext, _tr in successful:
+        bridges = ext.get("signal_flow", {}).get("bridges", [])
+        if not isinstance(bridges, list):
+            continue
+        seen_in_run: set[str] = set()
+        for bridge in bridges:
+            if not isinstance(bridge, str):
+                continue
+            norm = _normalize_bridge(bridge)
+            if norm is None:
+                continue
+            if norm not in seen_in_run:
+                seen_in_run.add(norm)
+                bridge_counts[norm] = bridge_counts.get(norm, 0) + 1
+
+    threshold = math.ceil(n / 2)
+    merged_bridges = [b for b, cnt in bridge_counts.items() if cnt >= threshold]
+
+    # ------------------------------------------------------------------
+    # Build merged dict from first successful run, swapping ports/bridges
+    # ------------------------------------------------------------------
+    merged = json.loads(json.dumps(first_ext))  # deep copy
+    signal_flow = merged.setdefault("signal_flow", {})
+    signal_flow["ports"] = merged_ports
+    signal_flow["bridges"] = merged_bridges
+
+    # ------------------------------------------------------------------
+    # Aggregate traces
+    # ------------------------------------------------------------------
+    total_estimated_input_tokens = sum(tr.estimated_input_tokens for _ext, tr in results)
+
+    total_prompt_tokens = sum((tr.usage.prompt_tokens if tr.usage else 0) for _ext, tr in results)
+    total_completion_tokens = sum(
+        (tr.usage.completion_tokens if tr.usage else 0) for _ext, tr in results
+    )
+    total_tokens = sum((tr.usage.total_tokens if tr.usage else 0) for _ext, tr in results)
+    total_elapsed_ms = sum((tr.usage.elapsed_ms if tr.usage else 0) for _ext, tr in results)
+
+    # Pick the most common model tier among successful runs
+    tier_votes: dict[str, int] = {}
+    pass_a_tier_votes: dict[str, int] = {}
+    pass_b_tier_votes: dict[str, int] = {}
+    for _ext, tr in successful:
+        if tr.model_tier:
+            tier_votes[tr.model_tier] = tier_votes.get(tr.model_tier, 0) + 1
+        if tr.pass_a_tier:
+            pass_a_tier_votes[tr.pass_a_tier] = pass_a_tier_votes.get(tr.pass_a_tier, 0) + 1
+        if tr.pass_b_tier:
+            pass_b_tier_votes[tr.pass_b_tier] = pass_b_tier_votes.get(tr.pass_b_tier, 0) + 1
+    best_tier = max(tier_votes, key=tier_votes.get) if tier_votes else ""
+    best_pass_a_tier = max(pass_a_tier_votes, key=pass_a_tier_votes.get) if pass_a_tier_votes else ""
+    best_pass_b_tier = max(pass_b_tier_votes, key=pass_b_tier_votes.get) if pass_b_tier_votes else ""
+
+    total_pass_a_tokens = sum(tr.pass_a_tokens for _ext, tr in results)
+    total_pass_b_tokens = sum(tr.pass_b_tokens for _ext, tr in results)
+
+    aggregated_usage = UsageRecord(
+        model=best_tier,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        total_tokens=total_tokens,
+        elapsed_ms=total_elapsed_ms,
+    )
+
+    # Union queries and validator misses across all runs
+    pass1_queries_union: list[str] = []
+    pass2_queries_union: list[str] = []
+    validator_misses_union: list[str] = []
+    seen_p1: set[str] = set()
+    seen_p2: set[str] = set()
+    seen_vm: set[str] = set()
+    max_retries = 0
+    floor_triggered = False
+
+    for _ext, tr in results:
+        for q in tr.pass1_queries:
+            if q not in seen_p1:
+                seen_p1.add(q)
+                pass1_queries_union.append(q)
+        for q in tr.pass2_queries:
+            if q not in seen_p2:
+                seen_p2.add(q)
+                pass2_queries_union.append(q)
+        for m in tr.validator_misses:
+            if m not in seen_vm:
+                seen_vm.add(m)
+                validator_misses_union.append(m)
+        if tr.retries > max_retries:
+            max_retries = tr.retries
+        if tr.model_filter_floor_triggered:
+            floor_triggered = True
+
+    composite_trace = ExtractionTrace(
+        classification=first_trace.classification,
+        pass1_queries=pass1_queries_union,
+        pass2_queries=pass2_queries_union,
+        pass1_chunk_count=max(tr.pass1_chunk_count for _ext, tr in results),
+        pass2_chunk_count=max(tr.pass2_chunk_count for _ext, tr in results),
+        deduped_chunk_count=max(tr.deduped_chunk_count for _ext, tr in results),
+        model_filtered_chunk_count=max(tr.model_filtered_chunk_count for _ext, tr in results),
+        effective_chunk_count=max(tr.effective_chunk_count for _ext, tr in results),
+        model_filter_floor_triggered=floor_triggered,
+        retries=max_retries,
+        validator_misses=validator_misses_union,
+        usage=aggregated_usage,
+        aliases_used=first_trace.aliases_used,
+        disambiguation_applied=first_trace.disambiguation_applied,
+        estimated_input_tokens=total_estimated_input_tokens,
+        model_tier=best_tier,
+        pass_a_tokens=total_pass_a_tokens,
+        pass_b_tokens=total_pass_b_tokens,
+        pass_a_tier=best_pass_a_tier,
+        pass_b_tier=best_pass_b_tier,
+    )
+
+    return merged, composite_trace

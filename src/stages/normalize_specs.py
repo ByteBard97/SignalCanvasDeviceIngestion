@@ -11,6 +11,8 @@ import copy
 import re
 from typing import Any
 
+from stages.device_enrichment import enrich_extraction
+
 # ---------------------------------------------------------------------------
 # Canonicalization tables
 # ---------------------------------------------------------------------------
@@ -184,7 +186,9 @@ _PLACEHOLDER_SPECS: dict[str, dict] = {
 
 def _canonicalize_name(name: str) -> str:
     """Map semantically-equivalent port names to a canonical form."""
-    lowered = name.lower()
+    # Strip leading numbers like "14 Assignable Local Outputs" → "Assignable Local Outputs"
+    cleaned = re.sub(r"^\d+\s*", "", name)
+    lowered = cleaned.lower()
     for canonical, patterns in _NAME_RULES:
         for pat in patterns:
             # Use word-boundary checks so short tokens like "lan" don't match
@@ -192,7 +196,7 @@ def _canonicalize_name(name: str) -> str:
             regex = r"(?<![a-z])" + re.escape(pat) + r"(?![a-z])"
             if re.search(regex, lowered):
                 return canonical
-    return name
+    return cleaned
 
 
 def _standardize_direction(direction: str | None, name: str) -> str | None:
@@ -308,6 +312,19 @@ def _has_port_category(ports: list[dict], category: str) -> bool:
     return False
 
 
+def _is_power_port(port: dict) -> bool:
+    """Return True if this port is a mains power input (not a signal-flow port)."""
+    name = (port.get("name") or "").lower()
+    power_keywords = [
+        "mains power", "power input", "ac power", "dc power",
+        "iec inlet", "power supply", "power inlet", "power socket",
+    ]
+    # Exact match for bare "Power" when connector also suggests mains
+    if name == "power":
+        return True
+    return any(kw in name for kw in power_keywords)
+
+
 def _placeholder_port(category: str) -> dict:
     """Create a low-confidence placeholder port for a missing category."""
     port = copy.deepcopy(_PLACEHOLDER_SPECS.get(category, _PLACEHOLDER_SPECS["control_port"]))
@@ -351,22 +368,35 @@ def _normalize_ports(raw_ports: list[dict]) -> list[dict]:
 
     # First dedupe by name alone — if the LLM emitted the same port twice
     # (e.g. main extraction + peripheral pass), keep the richer instance.
-    name_map: dict[str, dict] = {}
+    # Ports with the same name but different connectors are kept separate
+    # (e.g. "Assignable Local Outputs" on XLR vs TRS).
+    name_map: dict[str, list[dict]] = {}
     for port in normalized:
         name = port["name"]
         if name not in name_map:
-            name_map[name] = port
-        else:
-            existing = name_map[name]
-            # Keep the one with more fields filled in
-            existing_score = sum(1 for k in ("direction", "connector", "channels") if existing.get(k))
-            new_score = sum(1 for k in ("direction", "connector", "channels") if port.get(k))
-            if new_score > existing_score:
-                name_map[name] = port
-            elif new_score == existing_score:
-                name_map[name] = _merge_ports(existing, port)
+            name_map[name] = [port]
+            continue
 
-    normalized = list(name_map.values())
+        candidates = name_map[name]
+        merged = False
+        for i, existing in enumerate(candidates):
+            if existing.get("connector") == port.get("connector"):
+                # Same name + same connector → dedupe/merge
+                existing_score = sum(1 for k in ("direction", "connector", "channels") if existing.get(k))
+                new_score = sum(1 for k in ("direction", "connector", "channels") if port.get(k))
+                if new_score > existing_score:
+                    candidates[i] = port
+                elif new_score == existing_score:
+                    candidates[i] = _merge_ports(existing, port)
+                merged = True
+                break
+        if not merged:
+            # Different connector → keep as separate port
+            candidates.append(port)
+
+    normalized = []
+    for candidates in name_map.values():
+        normalized.extend(candidates)
 
     merged_map: dict[tuple[str, str | None, str | None], dict] = {}
     for port in normalized:
@@ -441,6 +471,9 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
     merged_ports.sort(key=lambda p: (p.get("direction") or "", p.get("name") or ""))
     deduped_bridges.sort()
 
+    # Filter out non-signal ports (power mains, etc.)
+    merged_ports = [p for p in merged_ports if not _is_power_port(p)]
+
     # General connector cleanup: normalize common variants
     _CONNECTOR_CLEANUP = {
         "rj-11": "RJ11",
@@ -480,4 +513,13 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
     signal_flow["bridges"] = deduped_bridges
 
     result = apply_bridge_heuristics(result, device_class)
+
+    # ------------------------------------------------------------------
+    # Enrichment: inject known missing ports for well-documented devices
+    # ------------------------------------------------------------------
+    device_metadata = extracted.get("device_metadata", {})
+    manufacturer = device_metadata.get("manufacturer", "")
+    model_number = device_metadata.get("model_number", "")
+    result = enrich_extraction(result, manufacturer, model_number)
+
     return result

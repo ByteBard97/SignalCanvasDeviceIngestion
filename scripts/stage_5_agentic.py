@@ -98,10 +98,7 @@ def _usd_cost(prompt_tokens: int, completion_tokens: int) -> float:
     else:
         in_rate = PRICE_32K_INPUT_PER_MTOK
         out_rate = PRICE_32K_OUTPUT_PER_MTOK
-    return (
-        prompt_tokens * in_rate / 1_000_000
-        + completion_tokens * out_rate / 1_000_000
-    )
+    return prompt_tokens * in_rate / 1_000_000 + completion_tokens * out_rate / 1_000_000
 
 
 def _fmt_usd(cost: float) -> str:
@@ -225,6 +222,10 @@ async def _process_one_device(
             "disambiguation_applied": trace.disambiguation_applied,
             "estimated_input_tokens": trace.estimated_input_tokens,
             "model_tier": trace.model_tier,
+            "pass_a_tokens": trace.pass_a_tokens,
+            "pass_b_tokens": trace.pass_b_tokens,
+            "pass_a_tier": trace.pass_a_tier,
+            "pass_b_tier": trace.pass_b_tier,
             "usage": {
                 "model": usage.model,
                 "prompt_tokens": usage.prompt_tokens,
@@ -233,7 +234,9 @@ async def _process_one_device(
                 "elapsed_ms": usage.elapsed_ms,
             },
         }
-        trace_path.write_text(json.dumps(trace_dict, indent=2, ensure_ascii=False), encoding="utf-8")
+        trace_path.write_text(
+            json.dumps(trace_dict, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
 
         return DeviceResult(
             device_id=device_id,
@@ -324,9 +327,7 @@ async def main() -> int:
             continue
 
         if r.error:
-            report_lines.append(
-                f"{r.device_id:<25} {r.model:<20} ERROR: {r.error}"
-            )
+            report_lines.append(f"{r.device_id:<25} {r.model:<20} ERROR: {r.error}")
             continue
 
         usd = _usd_cost(r.usage.prompt_tokens, r.usage.completion_tokens)

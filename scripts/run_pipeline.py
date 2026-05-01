@@ -8,6 +8,7 @@ it, and writes a JSON report.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -30,7 +31,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from harness.manifest import Manifest  # noqa: E402
 from moonshot_client import MoonshotClient, UsageRecord  # noqa: E402
-from stages.extract_specs_agentic import extract, ExtractionTrace  # noqa: E402
+from stages.extract_specs_agentic import extract, extract_n_shot, ExtractionTrace  # noqa: E402
 from stages.generate_patch import generate_patch  # noqa: E402
 from stages.normalize_specs import normalize_extraction  # noqa: E402
 from stages.validate_patch import validate_patch  # noqa: E402
@@ -86,6 +87,7 @@ class PipelineResult:
             model="", prompt_tokens=0, completion_tokens=0, total_tokens=0, elapsed_ms=0
         )
     )
+    n_shot: int = 1
 
     # Stage 5→6 transition
     normalized_ok: bool = False
@@ -106,7 +108,11 @@ class PipelineResult:
 
     @property
     def usd_cost(self) -> float:
-        return _usd_cost(self.usage.prompt_tokens, self.usage.completion_tokens)
+        return _usd_cost(
+            self.usage.prompt_tokens,
+            self.usage.completion_tokens,
+            self.usage.model,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +120,16 @@ class PipelineResult:
 # ---------------------------------------------------------------------------
 
 
-def _usd_cost(prompt_tokens: int, completion_tokens: int) -> float:
-    """Compute USD cost using 8K or 32K pricing based on prompt size."""
-    if prompt_tokens < CONTEXT_TIER_THRESHOLD:
-        in_rate = PRICE_8K_INPUT_PER_MTOK
-        out_rate = PRICE_8K_OUTPUT_PER_MTOK
-    else:
+def _usd_cost(prompt_tokens: int, completion_tokens: int, model: str = "") -> float:
+    """Compute USD cost using 8K or 32K pricing based on prompt size or model hint."""
+    # For n-shot, aggregated prompt_tokens may cross the threshold even though
+    # each individual call was billed at the 8K rate. Prefer the model string.
+    if "32k" in model.lower() or (not model and prompt_tokens >= CONTEXT_TIER_THRESHOLD):
         in_rate = PRICE_32K_INPUT_PER_MTOK
         out_rate = PRICE_32K_OUTPUT_PER_MTOK
+    else:
+        in_rate = PRICE_8K_INPUT_PER_MTOK
+        out_rate = PRICE_8K_OUTPUT_PER_MTOK
     return (
         prompt_tokens * in_rate / 1_000_000
         + completion_tokens * out_rate / 1_000_000
@@ -148,6 +156,7 @@ async def _process_one_device(
     manufacturer: str,
     model: str,
     corpus_id: str,
+    n_shot: int = 1,
 ) -> PipelineResult:
     """Run Stage 5 → 6 → 7 for one device."""
     result = PipelineResult(
@@ -155,6 +164,7 @@ async def _process_one_device(
         manufacturer=manufacturer,
         model=model,
         corpus_id=corpus_id,
+        n_shot=n_shot,
     )
 
     async with sem:
@@ -162,10 +172,16 @@ async def _process_one_device(
         # Stage 5: Extraction
         # ------------------------------------------------------------------
         try:
-            extracted, trace = await asyncio.wait_for(
-                extract(manufacturer, model, corpus_id, http, client),
-                timeout=PER_DEVICE_TIMEOUT_SECONDS,
-            )
+            if n_shot > 1:
+                extracted, trace = await asyncio.wait_for(
+                    extract_n_shot(http, corpus_id, manufacturer, model, client, n=n_shot),
+                    timeout=PER_DEVICE_TIMEOUT_SECONDS * n_shot,
+                )
+            else:
+                extracted, trace = await asyncio.wait_for(
+                    extract(manufacturer, model, corpus_id, http, client),
+                    timeout=PER_DEVICE_TIMEOUT_SECONDS,
+                )
         except asyncio.TimeoutError:
             result.stage5_error = "Extraction timeout"
             return result
@@ -271,6 +287,16 @@ async def _process_one_device(
 
 
 async def main() -> int:
+    parser = argparse.ArgumentParser(description="Pipeline: Stage 5 → 6 → 7")
+    parser.add_argument(
+        "--n-shot",
+        type=int,
+        default=1,
+        help="Number of extraction shots to run per device (default: 1)",
+    )
+    args = parser.parse_args()
+    n_shot = args.n_shot
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -281,6 +307,7 @@ async def main() -> int:
 
     print("=== Pipeline: Stage 5 → 6 → 7 ===")
     print(f"Devices to process: {len(DEVICES)}")
+    print(f"N-shot: {n_shot}")
     for did, mfr, mdl, cid in DEVICES:
         print(f"  - {did} | {mfr} {mdl} (corpus={cid})")
     print()
@@ -290,7 +317,7 @@ async def main() -> int:
 
     sem = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
     tasks = [
-        _process_one_device(sem, http, client, manifest, did, mfr, mdl, cid)
+        _process_one_device(sem, http, client, manifest, did, mfr, mdl, cid, n_shot)
         for did, mfr, mdl, cid in DEVICES
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -304,6 +331,7 @@ async def main() -> int:
     report_lines: list[str] = []
     report_lines.append("=" * 110)
     report_lines.append("PIPELINE RESULTS")
+    report_lines.append(f"N-shot: {n_shot}")
     report_lines.append(
         f"{'Device':<25} {'Stage5':>8} {'Normalized':>12} {'Stage6':>8} "
         f"{'Stage7':>8} {'Output'}"
@@ -355,6 +383,7 @@ async def main() -> int:
             "output_path": r.output_path,
             "invalid_path": r.invalid_path,
             "usd_cost": r.usd_cost,
+            "n_shot": r.n_shot,
         })
 
     report_lines.append("-" * 110)
@@ -379,6 +408,7 @@ async def main() -> int:
             "invalid_count": invalid_count,
             "failed_stage5_count": len(DEVICES) - valid_count - invalid_count,
             "total_usd": total_usd,
+            "n_shot": n_shot,
         },
     }
 
