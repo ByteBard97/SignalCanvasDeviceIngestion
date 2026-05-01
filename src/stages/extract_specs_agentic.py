@@ -23,13 +23,13 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from moonshot_client import MoonshotClient, UsageRecord  # noqa: E402
 from stages._ragscallion import search_ragscallion  # noqa: E402
 from stages.classify_device import classify, Classification  # noqa: E402
+from stages.sku_aliases import get_registry, AliasEntry  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-EXTRACTION_MODEL = "moonshot-v1-8k"
 RAGSCALLION_SEARCH_URL = "http://192.168.0.200:8086/search"
 DEFAULT_PASS_LIMIT = 5
 DEFAULT_GENERIC_LIMIT = 3
@@ -38,6 +38,29 @@ PROMPT_CHAR_BUDGET = 6000
 PER_DEVICE_TIMEOUT_SECONDS = 120
 MODEL_FILTER_MIN_CHUNKS = 8
 MAX_CHUNKS_PER_PROMPT = 40
+EXTRACTION_TEMPERATURE = 0.0
+EXTRACTION_SEED = 42
+
+# Auto-routing tiers, ordered cheapest → largest. Each entry maps a Moonshot
+# model to the maximum input-token count we'll send under the OUTPUT_BUDGET.
+TIER_INPUT_LIMITS = [
+    ("moonshot-v1-8k",   7500),
+    ("moonshot-v1-32k",  30000),
+    ("moonshot-v1-128k", 120000),
+]
+OUTPUT_BUDGET_TOKENS = 700
+
+
+def pick_tier(estimated_input_tokens: int) -> str:
+    """Return the smallest Moonshot tier that fits this prompt with headroom."""
+    needed = estimated_input_tokens + OUTPUT_BUDGET_TOKENS
+    for model, limit in TIER_INPUT_LIMITS:
+        if needed <= limit:
+            return model
+    raise RuntimeError(
+        f"Prompt too large even for largest tier: {needed} tokens "
+        f"(limits: {TIER_INPUT_LIMITS})"
+    )
 
 # Required port categories per class (for validator)
 REQUIRED_CATEGORIES: dict[str, list[str]] = {
@@ -71,6 +94,10 @@ class ExtractionTrace:
     retries: int = 0
     validator_misses: list[str] = field(default_factory=list)
     usage: Optional[UsageRecord] = None
+    aliases_used: list[str] = field(default_factory=list)
+    disambiguation_applied: bool = False
+    estimated_input_tokens: int = 0
+    model_tier: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +105,12 @@ class ExtractionTrace:
 # ---------------------------------------------------------------------------
 
 
-def _build_prompt(manufacturer: str, model: str, chunks: list[dict]) -> str:
+def _build_prompt(
+    manufacturer: str,
+    model: str,
+    chunks: list[dict],
+    disambiguation: Optional[str] = None,
+) -> str:
     """Build the single-shot extraction prompt."""
     chunks_text = ""
     for chunk in chunks:
@@ -87,9 +119,17 @@ def _build_prompt(manufacturer: str, model: str, chunks: list[dict]) -> str:
         text = chunk.get("text", "")
         chunks_text += f"[{source}, {section}]\n{text}\n\n"
 
+    disambiguation_section = ""
+    if disambiguation:
+        disambiguation_section = (
+            f"DEVICE DISAMBIGUATION (READ CAREFULLY):\n"
+            f"{disambiguation}\n\n"
+        )
+
     prompt = (
         f"You are the SignalCanvas device-extraction agent. Extract a structured "
         f"device template for {manufacturer} {model} from the chunks below.\n\n"
+        f"{disambiguation_section}"
         f"Required output: JSON only, matching this schema (no commentary, no markdown):\n"
         f"{{\n"
         f'  "device_metadata": {{ "manufacturer", "model_number", "label", "device_type", "category" }},\n'
@@ -151,15 +191,26 @@ def _dedupe_chunks(chunks: list[dict]) -> list[dict]:
     return out
 
 
-def _filter_by_model_token(chunks: list[dict], model: str) -> tuple[list[dict], bool]:
-    """Prefer chunks containing the exact model token (case-insensitive).
+def _filter_by_model_token(
+    chunks: list[dict],
+    model: str,
+    aliases: Optional[list[str]] = None,
+) -> tuple[list[dict], bool]:
+    """Prefer chunks containing the exact model token or any alias (case-insensitive).
 
     Returns (selected_chunks, floor_triggered).  If the filtered set drops
     below MODEL_FILTER_MIN_CHUNKS we fall back to the full deduped set so
     the LLM prompt isn't starved of context.
     """
-    token = model.lower()
-    filtered = [c for c in chunks if token in c.get("text", "").lower()]
+    tokens = [model.lower()]
+    if aliases:
+        tokens.extend(a.lower() for a in aliases)
+
+    def _matches(chunk: dict) -> bool:
+        text = chunk.get("text", "").lower()
+        return any(token in text for token in tokens)
+
+    filtered = [c for c in chunks if _matches(c)]
     if not filtered:
         return chunks, False
     if len(filtered) < MODEL_FILTER_MIN_CHUNKS:
@@ -310,6 +361,15 @@ async def extract(
         classification=Classification(class_="generic", confidence=0.0, source="unknown"),
     )
 
+    # 0. Alias lookup
+    registry = get_registry()
+    alias_entry = registry.lookup(manufacturer, model)
+    aliases = alias_entry.aliases if alias_entry else None
+    disambiguation = alias_entry.disambiguation if alias_entry else None
+    if alias_entry:
+        trace.aliases_used = list(alias_entry.aliases)
+        trace.disambiguation_applied = True
+
     # 1. Classify
     classification = await classify(manufacturer, model)
     trace.classification = classification
@@ -332,8 +392,8 @@ async def extract(
     all_chunks = _dedupe_chunks(pass1_chunks + pass2_chunks)
     trace.deduped_chunk_count = len(all_chunks)
 
-    # 6. Model-token filter with chunk-count floor
-    filtered, floor_triggered = _filter_by_model_token(all_chunks, model)
+    # 6. Model-token filter with chunk-count floor (alias-aware)
+    filtered, floor_triggered = _filter_by_model_token(all_chunks, model, aliases)
     trace.model_filtered_chunk_count = len(filtered)
     trace.model_filter_floor_triggered = floor_triggered
     chunks_to_use = filtered if filtered and not floor_triggered else all_chunks
@@ -343,12 +403,13 @@ async def extract(
     # so peripheral pages (often surfaced by pass-2) aren't silently dropped.
     if len(chunks_to_use) > MAX_CHUNKS_PER_PROMPT:
         model_token = model.lower()
+        alias_tokens = [a.lower() for a in aliases] if aliases else []
         pass1_keys = {_chunk_key(c) for c in pass1_chunks}
 
         def _priority(chunk: dict) -> int:
             key = _chunk_key(chunk)
             text = chunk.get("text", "").lower()
-            if model_token in text:
+            if model_token in text or any(a in text for a in alias_tokens):
                 return 0  # highest — keep all model-matching chunks
             if key in pass1_keys:
                 return 1  # medium — pass-1 type-specific
@@ -364,13 +425,32 @@ async def extract(
         chunks_to_use = chunks_to_use[:MAX_CHUNKS_PER_PROMPT]
     trace.effective_chunk_count = len(chunks_to_use)
 
-    # 7. Build prompt & call Moonshot
-    prompt = _build_prompt(manufacturer, model, chunks_to_use)
+    # 7. Stable chunk ordering before prompt build (eliminates retrieval-order noise)
+    chunks_to_use = sorted(
+        chunks_to_use,
+        key=lambda c: (
+            c.get("source", ""),
+            c.get("page", ""),
+            c.get("section", ""),
+            c.get("chunk_id", ""),
+        ),
+    )
+
+    # 8. Build prompt, estimate tokens, pick tier, call Moonshot
+    prompt = _build_prompt(manufacturer, model, chunks_to_use, disambiguation)
+    estimated = await moonshot.estimate_tokens(prompt)
+    trace.estimated_input_tokens = estimated
+    tier = pick_tier(estimated)
+    trace.model_tier = tier
+    logger.info(
+        f"{manufacturer} {model}: estimated {estimated} tokens → tier {tier}"
+    )
     text, usage = await moonshot.chat_completion(
         prompt,
-        model=EXTRACTION_MODEL,
+        model=tier,
         response_format_json=True,
-        temperature=0.0,
+        temperature=EXTRACTION_TEMPERATURE,
+        seed=EXTRACTION_SEED,
     )
     trace.usage = usage
 
@@ -395,17 +475,18 @@ async def extract(
         )
         if extra_chunks:
             all_chunks = _dedupe_chunks(all_chunks + extra_chunks)
-            filtered, floor_triggered = _filter_by_model_token(all_chunks, model)
+            filtered, floor_triggered = _filter_by_model_token(all_chunks, model, aliases)
             trace.model_filter_floor_triggered = floor_triggered
             chunks_to_use = filtered if filtered and not floor_triggered else all_chunks
             if len(chunks_to_use) > MAX_CHUNKS_PER_PROMPT:
                 model_token = model.lower()
+                alias_tokens = [a.lower() for a in aliases] if aliases else []
                 pass1_keys = {_chunk_key(c) for c in pass1_chunks}
 
                 def _retry_priority(chunk: dict) -> int:
                     key = _chunk_key(chunk)
                     text = chunk.get("text", "").lower()
-                    if model_token in text:
+                    if model_token in text or any(a in text for a in alias_tokens):
                         return 0
                     if key in pass1_keys:
                         return 1
@@ -416,12 +497,20 @@ async def extract(
             trace.model_filtered_chunk_count = len(filtered)
             trace.effective_chunk_count = len(chunks_to_use)
 
-            prompt = _build_prompt(manufacturer, model, chunks_to_use)
+            prompt = _build_prompt(manufacturer, model, chunks_to_use, disambiguation)
+            estimated_retry = await moonshot.estimate_tokens(prompt)
+            trace.estimated_input_tokens = estimated_retry
+            tier_retry = pick_tier(estimated_retry)
+            trace.model_tier = tier_retry
+            logger.info(
+                f"{manufacturer} {model} (retry): estimated {estimated_retry} tokens → tier {tier_retry}"
+            )
             text, usage = await moonshot.chat_completion(
                 prompt,
-                model=EXTRACTION_MODEL,
+                model=tier_retry,
                 response_format_json=True,
-                temperature=0.0,
+                temperature=EXTRACTION_TEMPERATURE,
+                seed=EXTRACTION_SEED,
             )
             trace.usage = usage
             try:

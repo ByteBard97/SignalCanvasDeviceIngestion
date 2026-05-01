@@ -212,6 +212,10 @@ async def _process_one_device(
             "model_filtered_chunk_count": trace.model_filtered_chunk_count,
             "retries": trace.retries,
             "validator_misses": trace.validator_misses,
+            "aliases_used": trace.aliases_used,
+            "disambiguation_applied": trace.disambiguation_applied,
+            "estimated_input_tokens": trace.estimated_input_tokens,
+            "model_tier": trace.model_tier,
             "usage": {
                 "model": usage.model,
                 "prompt_tokens": usage.prompt_tokens,

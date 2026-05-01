@@ -82,6 +82,7 @@ class MoonshotClient:
         temperature: float = 0.0,
         max_tokens: Optional[int] = None,
         response_format_json: bool = False,
+        seed: Optional[int] = None,
     ) -> tuple[str, UsageRecord]:
         """Send a single-turn chat completion and return (text, usage).
 
@@ -103,6 +104,8 @@ class MoonshotClient:
         if response_format_json:
             # Moonshot supports OpenAI-style JSON mode for structured output.
             kwargs["response_format"] = {"type": "json_object"}
+        if seed is not None:
+            kwargs["seed"] = seed
 
         start = time.monotonic()
         resp = await self._client.chat.completions.create(**kwargs)

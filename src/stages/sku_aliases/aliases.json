@@ -1,0 +1,20 @@
+{
+  "Audinate:AVIO-AO2": {
+    "aliases": [
+      "ADP-DAO-AU-0X2",
+      "Analog Output 2 Channel",
+      "Output 2 Channel",
+      "2 Channel Output"
+    ],
+    "disambiguation": "AVIO-AO2 is the 2-channel Dante-to-analog OUTPUT adapter. The shared family datasheet covers AI1/AI2/AO1/AO2; extract specs ONLY for the column or row matching '2 Channel Analog Output' / 'ADP-DAO-AU-0X2'. AVIO-AO2 has 0 analog inputs and 2 analog outputs (XLR-M)."
+  },
+  "Audinate:AVIO-AI2": {
+    "aliases": [
+      "ADP-DAI-AU-2X0",
+      "Analog Input 2 Channel",
+      "Input 2 Channel",
+      "2 Channel Input"
+    ],
+    "disambiguation": "AVIO-AI2 is the 2-channel analog-to-Dante INPUT adapter. Shared family datasheet; extract ONLY the '2 Channel Analog Input' / 'ADP-DAI-AU-2X0' column. AVIO-AI2 has 2 analog inputs (XLR-F) and 0 analog outputs (it converts analog to Dante; the only 'output' is the Dante network)."
+  }
+}
