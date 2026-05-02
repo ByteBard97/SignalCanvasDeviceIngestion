@@ -1,0 +1,130 @@
+{
+  "_comment": "Manually curated ground-truth signal-flow specs for calibration devices. Sources: manufacturer datasheets, user manuals, rear-panel photos. Power ports intentionally excluded.",
+  "devices": {
+    "yamaha-rio1608-d2": {
+      "device_metadata": {
+        "manufacturer": "Yamaha",
+        "model_number": "Rio1608-D2",
+        "category": "Audio Networking"
+      },
+      "signal_flow": {
+        "ports": [
+          {"name": "Analog Input", "direction": "input", "connector": "XLR", "channels": 16, "attributes": ["balanced"]},
+          {"name": "Main Output", "direction": "output", "connector": "XLR", "channels": 8, "attributes": ["balanced"]},
+          {"name": "Dante", "direction": "input_output", "connector": "RJ45", "channels": 24, "attributes": ["etherCON", "primary"]}
+        ],
+        "bridges": [
+          "Analog Input -> Dante",
+          "Dante -> Main Output"
+        ]
+      }
+    },
+    "audinate-avio-ao2": {
+      "device_metadata": {
+        "manufacturer": "Audinate",
+        "model_number": "AVIO-AO2",
+        "category": "Audio Networking"
+      },
+      "signal_flow": {
+        "ports": [
+          {"name": "Dante", "direction": "input", "connector": "RJ45", "channels": null, "attributes": null},
+          {"name": "Main Output", "direction": "output", "connector": "XLR_M", "channels": 2, "attributes": null}
+        ],
+        "bridges": [
+          "Dante -> Main Output"
+        ]
+      }
+    },
+    "audinate-avio-ai2": {
+      "device_metadata": {
+        "manufacturer": "Audinate",
+        "model_number": "AVIO-AI2",
+        "category": "Audio Interface"
+      },
+      "signal_flow": {
+        "ports": [
+          {"name": "Analog Input", "direction": "input", "connector": "XLR_F", "channels": 2, "attributes": null},
+          {"name": "Dante", "direction": "input_output", "connector": "RJ45", "channels": null, "attributes": null}
+        ],
+        "bridges": [
+          "Analog Input -> Dante"
+        ]
+      }
+    },
+    "shure-ulxd4": {
+      "device_metadata": {
+        "manufacturer": "Shure",
+        "model_number": "ULXD4",
+        "category": "Audio"
+      },
+      "signal_flow": {
+        "ports": [
+          {"name": "RF Antenna", "direction": "input", "connector": "BNC", "channels": 2, "attributes": null},
+          {"name": "Network", "direction": "input", "connector": "RJ45", "channels": null, "attributes": null},
+          {"name": "Balanced XLR Audio Output", "direction": "output", "connector": "XLR", "channels": null, "attributes": null},
+          {"name": "Balanced 1/4\" (6.35 mm) TRS Audio Output", "direction": "output", "connector": "1/4\" TRS", "channels": null, "attributes": null}
+        ],
+        "bridges": [
+          "RF Antenna -> Balanced XLR Audio Output",
+          "RF Antenna -> Balanced 1/4\" (6.35 mm) TRS Audio Output"
+        ]
+      },
+      "_notes": [
+        "ULXD4 is single-channel; no Dante, no cascade, no GPIO (those are ULXD4D/ULXD4Q only).",
+        "TA4M/LEMO is a transmitter input (ULXD1), not a receiver port.",
+        "Mic/Line switch is a setting, not a physical port."
+      ]
+    },
+    "allen-heath-sq5": {
+      "device_metadata": {
+        "manufacturer": "Allen & Heath",
+        "model_number": "SQ-5",
+        "category": "Audio"
+      },
+      "signal_flow": {
+        "ports": [
+          {"name": "Analog Input", "direction": "input", "connector": "XLR", "channels": 16, "attributes": ["balanced"]},
+          {"name": "Stereo Input", "direction": "input", "connector": "3.5mm", "channels": 2, "attributes": ["unbalanced"]},
+          {"name": "Talkback", "direction": "input", "connector": "XLR", "channels": null, "attributes": ["balanced"]},
+          {"name": "Network", "direction": "input", "connector": "RJ45", "channels": null, "attributes": null},
+          {"name": "SLink", "direction": "input", "connector": "RJ45", "channels": null, "attributes": ["remote_audio"]},
+          {"name": "USB", "direction": "input", "connector": "USB-B", "channels": null, "attributes": null},
+          {"name": "AES Digital Output", "direction": "output", "connector": "XLR", "channels": null, "attributes": ["AES_EBU"]},
+          {"name": "Assignable Local Outputs", "direction": "output", "connector": "XLR", "channels": 12, "attributes": ["balanced"]},
+          {"name": "TRS Local Outputs", "direction": "output", "connector": "TRS", "channels": 2, "attributes": null},
+          {"name": "Headphone", "direction": "output", "connector": "TRS", "channels": null, "attributes": ["unbalanced"]}
+        ],
+        "bridges": []
+      },
+      "_notes": [
+        "SQ-5 has 2x 3.5mm stereo inputs (ST1/ST2); no 1/4in stereo inputs.",
+        "Footswitch and MIDI are control ports, excluded from signal-flow ground truth.",
+        "USB-A (SQ-Drive) is for recording/playback, excluded."
+      ]
+    },
+    "qsc-core-110f": {
+      "device_metadata": {
+        "manufacturer": "QSC",
+        "model_number": "Core 110f",
+        "category": "Audio Signal Processor"
+      },
+      "signal_flow": {
+        "ports": [
+          {"name": "Analog Audio Inputs", "direction": "input", "connector": "Euroblock", "channels": 8, "attributes": null},
+          {"name": "GPI", "direction": "input", "connector": "Euroblock", "channels": 16, "attributes": null},
+          {"name": "FlexChannels", "direction": "input_output", "connector": "Euroblock", "channels": 8, "attributes": null},
+          {"name": "Network", "direction": "input_output", "connector": "RJ45", "channels": 2, "attributes": null},
+          {"name": "POTS", "direction": "input_output", "connector": "RJ11", "channels": null, "attributes": null},
+          {"name": "VoIP", "direction": "input_output", "connector": "RJ45", "channels": null, "attributes": null},
+          {"name": "Analog Audio Outputs", "direction": "output", "connector": "Euroblock", "channels": 8, "attributes": null},
+          {"name": "GPO", "direction": "output", "connector": "Euroblock", "channels": 16, "attributes": null}
+        ],
+        "bridges": []
+      },
+      "_notes": [
+        "USB host ports are for control/recording, excluded from signal-flow ground truth.",
+        "GPI/GPO are logic ports but included as they are physical connectors."
+      ]
+    }
+  }
+}

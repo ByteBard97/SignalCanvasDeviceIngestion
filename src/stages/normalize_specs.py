@@ -325,6 +325,79 @@ def _is_power_port(port: dict) -> bool:
     return any(kw in name for kw in power_keywords)
 
 
+def _drop_false_positives(ports: list[dict], device_class: str) -> list[dict]:
+    """Remove known false-positive ports that the LLM commonly hallucinates."""
+    result: list[dict] = []
+    has_rf_antenna = any("rf antenna" in (p.get("name") or "").lower() for p in ports)
+    for p in ports:
+        name = (p.get("name") or "").lower()
+        direction = (p.get("direction") or "").strip()
+        connector = (p.get("connector") or "").strip()
+
+        # Wireless receivers: drop SMA_Connector when RF_Antenna already exists
+        # (ULXD4 has BNC antenna connectors, not SMA)
+        if device_class == "wireless_rx" and has_rf_antenna and "sma" in name:
+            continue
+
+        # Drop ports that have neither direction nor connector — these are specs,
+        # not physical signal ports (e.g., "Gain/Attenuation", "Resolution").
+        if not direction and not connector:
+            continue
+
+        # Drop TA4M/LEMO on wireless receivers — it's a transmitter input, not a receiver port
+        if device_class == "wireless_rx" and "ta4m" in name:
+            continue
+
+        # Dante input adapters (e.g., AVIO-AI2) should not have analog outputs or separate Network ports
+        if device_class == "dante_adapter_input":
+            if "main output" in name or "network" in name:
+                continue
+
+        # Dante output adapters (e.g., AVIO-AO2) should not have analog inputs or separate Network ports
+        if device_class == "dante_adapter_output":
+            if "analog input" in name or "network" in name:
+                continue
+
+        result.append(p)
+    return result
+
+
+def _clean_attributes(attrs: list[str] | None) -> list[str] | None:
+    """Drop sentence-length descriptions; keep only short tags."""
+    if not attrs:
+        return None
+    cleaned: list[str] = []
+    for a in attrs:
+        s = str(a).strip()
+        if not s:
+            continue
+        # Drop full sentences (long AND contain spaces)
+        if len(s) > 25 or (len(s) > 15 and " " in s):
+            continue
+        cleaned.append(s)
+    return cleaned if cleaned else None
+
+
+# Ports that are always a single physical connector regardless of audio channels
+_SINGLE_CONNECTOR_PORTS: list[str] = [
+    "headphone",
+    "talkback",
+    "aes digital output",
+    "aes output",
+    "aes3 output",
+]
+
+
+def _correct_channels(port: dict) -> None:
+    """Fix common channel-count miscounts (audio channels vs physical connectors)."""
+    name = (port.get("name") or "").lower()
+    for pattern in _SINGLE_CONNECTOR_PORTS:
+        if pattern in name:
+            # A headphone jack, talkback XLR, or AES output is ONE physical connector
+            port["channels"] = None
+            break
+
+
 def _placeholder_port(category: str) -> dict:
     """Create a low-confidence placeholder port for a missing category."""
     port = copy.deepcopy(_PLACEHOLDER_SPECS.get(category, _PLACEHOLDER_SPECS["control_port"]))
@@ -473,6 +546,7 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
 
     # Filter out non-signal ports (power mains, etc.)
     merged_ports = [p for p in merged_ports if not _is_power_port(p)]
+    merged_ports = _drop_false_positives(merged_ports, device_class)
 
     # General connector cleanup: normalize common variants
     _CONNECTOR_CLEANUP = {
@@ -508,6 +582,11 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
             if override_key.lower() == device_key.lower():
                 if port_name in overrides:
                     port["direction"] = overrides[port_name]
+
+    # Cleanup: correct single-connector ports and strip sentence-length attributes
+    for port in merged_ports:
+        _correct_channels(port)
+        port["attributes"] = _clean_attributes(port.get("attributes"))
 
     signal_flow["ports"] = merged_ports
     signal_flow["bridges"] = deduped_bridges

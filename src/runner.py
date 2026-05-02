@@ -44,6 +44,14 @@ from .pipeline_stages import (
 )
 from .polling_loop import run_polling_loop
 from .ragscallion_client import RagscallionClient
+from .stages.generate_patch import generate_patch
+from .stages.normalize_specs import normalize_extraction
+from .stages.validate_patch import validate_patch
+from .stages.classify_device import classify
+
+# Stage status constants reused from pipeline_stages
+STAGE_COMPLETED = 2
+STAGE_FAILED = 3
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +169,72 @@ async def _run_stage_5_batch(
 ) -> dict[str, int]:
     """Run Stage 5 (extract specs) on all nodes in queue_3."""
     return await process_stage_5_batch(manifest, ragscallion_client)
+
+
+async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
+    """Run Stage 6 (generate patch) and Stage 7 (validate) on queue_5 nodes."""
+    from .stages.generate_patch import generate_patch
+    from .stages.normalize_specs import normalize_extraction
+    from .stages.validate_patch import validate_patch
+    from .stages.classify_device import classify
+    from .harness.manifest import (
+        QUEUE_4_MANUAL_REVIEW,
+        QUEUE_5_COMPLETED,
+        FailureCategory,
+    )
+
+    nodes = [
+        n for n in manifest.list_by_queue(QUEUE_5_COMPLETED)
+        if n.stage_generate_patch == 0 and n.specs_json
+    ]
+    if not nodes:
+        return {"successful": 0, "failed": 0}
+
+    logger.info(f"Stage 6-7: processing {len(nodes)} nodes")
+    successful = 0
+    failed = 0
+
+    for node in nodes:
+        try:
+            extracted = json.loads(node.specs_json)
+            classification = await classify(node.manufacturer, node.model)
+            normalized = normalize_extraction(extracted, classification.class_)
+            patch_source = generate_patch(normalized)
+            node.stage_generate_patch = 2
+
+            is_valid, errors = validate_patch(patch_source)
+            if is_valid:
+                node.stage_validate_patch = 2
+                node.patch_source = patch_source
+                successful += 1
+                logger.info(f"Device {node.device_id} patch generated and validated")
+            else:
+                node.failure_stage = 7
+                node.failure_category = FailureCategory.PATCH_VALIDATION_FAILED.value
+                node.failure_message = f"Patch validation failed: {errors}"
+                node.failure_retryable = False
+                node.failure_attempts += 1
+                node.failure_at = datetime.now(timezone.utc).isoformat()
+                node.queue = QUEUE_4_MANUAL_REVIEW
+                node.stage_validate_patch = 3
+                node.patch_source = patch_source
+                failed += 1
+                logger.warning(f"Device {node.device_id} patch validation failed: {errors}")
+        except Exception as e:
+            node.failure_stage = 6
+            node.failure_category = FailureCategory.PATCH_GENERATION_FAILED.value
+            node.failure_message = f"Patch generation/validation error: {e}"
+            node.failure_retryable = True
+            node.failure_attempts += 1
+            node.failure_at = datetime.now(timezone.utc).isoformat()
+            node.queue = QUEUE_4_MANUAL_REVIEW
+            failed += 1
+            logger.warning(f"Device {node.device_id} Stage 6-7 error: {e}")
+
+        manifest.persist(node)
+
+    logger.info(f"Stage 6-7 complete: {successful} successful, {failed} failed")
+    return {"successful": successful, "failed": failed}
 
 
 def _load_devices(path: Path) -> list[tuple[str, str, str]]:
@@ -310,6 +384,10 @@ async def run_pipeline(
             if queue_3_nodes:
                 # Stage 5: Extract specs
                 await _run_stage_5_batch(manifest, ragscallion_client)
+
+            # Stage 6-7: Generate and validate PatchLang for any nodes
+            # that completed Stage 5 but haven't run Stage 6 yet.
+            await _run_stage_67_batch(manifest)
 
             if _is_pipeline_done(manifest):
                 logger.info("Pipeline complete — no nodes remain in active queues")

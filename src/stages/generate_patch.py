@@ -65,11 +65,45 @@ def _map_direction(direction: str | None) -> str:
     return "io"
 
 
+# Map messy extracted connector strings to clean canonical names
+_CONNECTOR_CANON: dict[str, str] = {
+    "1/4 trs": "TRS",
+    '1/4" trs': "TRS",
+    "1/4 ts": "TS",
+    '1/4" ts': "TS",
+    "3.5mm": "MiniJack",
+    "3.5 mm": "MiniJack",
+    "mini jack": "MiniJack",
+    "minijack": "MiniJack",
+    "ta4m": "LEMO",
+    "ta4f": "LEMO",
+    "usb_b": "USB-B",
+    "usb b": "USB-B",
+    "usb-a": "USB-A",
+    "usb a": "USB-A",
+    "xlr 3-31": "XLR",
+    "xlr 3-32": "XLR",
+    "xlr 3-33": "XLR",
+    "xlr 3-34": "XLR",
+    "xlr-3-31": "XLR",
+    "xlr-3-32": "XLR",
+    "xlr-3-33": "XLR",
+    "xlr-3-34": "XLR",
+}
+
+
+def _canonicalize_connector(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    key = raw.strip().lower()
+    return _CONNECTOR_CANON.get(key, raw)
+
+
 def _build_port_line(port: dict) -> str:
     """Render a single PatchLang port definition."""
     name = _sanitize_identifier(port.get("name", "Port"))
     direction = _map_direction(port.get("direction"))
-    connector = port.get("connector")
+    connector = _canonicalize_connector(port.get("connector"))
     channels = _parse_channels(port.get("channels"))
     attrs = port.get("attributes")
 
@@ -82,7 +116,12 @@ def _build_port_line(port: dict) -> str:
         parts.append(f"({_sanitize_identifier(connector)})")
 
     if attrs:
-        sanitized_attrs = [_sanitize_attribute(str(a)) for a in attrs if str(a).strip()]
+        # Belt-and-suspenders: drop anything that still looks like a sentence
+        sanitized_attrs = [
+            _sanitize_attribute(str(a))
+            for a in attrs
+            if str(a).strip() and len(str(a).strip()) <= 25 and not (len(str(a).strip()) > 15 and " " in str(a).strip())
+        ]
         if sanitized_attrs:
             parts.append(f" [{', '.join(sanitized_attrs)}]")
 

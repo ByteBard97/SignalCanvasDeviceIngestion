@@ -265,8 +265,11 @@ def test_yamaha_rio_dante_canonicalized() -> None:
     ports = result["signal_flow"]["ports"]
     dante_ports = [p for p in ports if p["name"] == "Dante"]
     assert len(dante_ports) == 1
-    # Existing non-null connector is preserved (only null connectors are inferred)
-    assert dante_ports[0]["connector"] == "etherCON Cat5e"
+    # Fixture currently has RJ45; enrichment only backfills null connectors
+    assert dante_ports[0]["connector"] == "RJ45"
+    attrs = dante_ports[0].get("attributes") or []
+    assert "etherCON" in attrs
+    assert "Cat5e" in attrs
 
 
 def test_qsc_core_network_placeholder() -> None:
