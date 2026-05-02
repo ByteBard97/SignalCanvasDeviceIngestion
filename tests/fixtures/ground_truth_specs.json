@@ -88,7 +88,6 @@
           {"name": "Talkback", "direction": "input", "connector": "XLR", "channels": null, "attributes": ["balanced"]},
           {"name": "Network", "direction": "input", "connector": "RJ45", "channels": null, "attributes": null},
           {"name": "SLink", "direction": "input", "connector": "RJ45", "channels": null, "attributes": ["remote_audio"]},
-          {"name": "USB", "direction": "input", "connector": "USB-B", "channels": null, "attributes": null},
           {"name": "AES Digital Output", "direction": "output", "connector": "XLR", "channels": null, "attributes": ["AES_EBU"]},
           {"name": "Assignable Local Outputs", "direction": "output", "connector": "XLR", "channels": 12, "attributes": ["balanced"]},
           {"name": "TRS Local Outputs", "direction": "output", "connector": "TRS", "channels": 2, "attributes": null},

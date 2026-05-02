@@ -325,6 +325,22 @@ def _is_power_port(port: dict) -> bool:
     return any(kw in name for kw in power_keywords)
 
 
+def _is_control_port(port: dict) -> bool:
+    """Return True if this port is a control/data port (not an audio signal-flow port).
+
+    USB ports are control/peripheral interfaces, not audio signal paths.
+    They should not appear in PatchLang templates.
+    """
+    name = (port.get("name") or "").lower()
+    connector = (port.get("connector") or "").lower()
+    # Drop any port whose primary identity is USB
+    if "usb" in name:
+        return True
+    if connector in ("usb", "usb-a", "usb_b", "usb-b", "usb_c", "usb-c"):
+        return True
+    return False
+
+
 def _drop_false_positives(ports: list[dict], device_class: str) -> list[dict]:
     """Remove known false-positive ports that the LLM commonly hallucinates."""
     result: list[dict] = []
@@ -544,8 +560,9 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
     merged_ports.sort(key=lambda p: (p.get("direction") or "", p.get("name") or ""))
     deduped_bridges.sort()
 
-    # Filter out non-signal ports (power mains, etc.)
+    # Filter out non-signal ports (power mains, USB control ports, etc.)
     merged_ports = [p for p in merged_ports if not _is_power_port(p)]
+    merged_ports = [p for p in merged_ports if not _is_control_port(p)]
     merged_ports = _drop_false_positives(merged_ports, device_class)
 
     # General connector cleanup: normalize common variants
