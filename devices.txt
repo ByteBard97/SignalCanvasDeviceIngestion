@@ -4,3 +4,4 @@ SHURE|ULXD4|shure-ulxd4
 ALLEN_HEATH|SQ-5|allen-heath-sq5
 SENNHEISER|EW-DX-EM|sennheiser-ew-dx-em
 AUDINATE|AVIO-AI2|audinate-avio-ai2
+QSC|Core 110f|qsc-core-110f
