@@ -60,7 +60,6 @@
       "signal_flow": {
         "ports": [
           {"name": "RF Antenna", "direction": "input", "connector": "BNC", "channels": 2, "attributes": null},
-          {"name": "Network", "direction": "input", "connector": "RJ45", "channels": null, "attributes": null},
           {"name": "Balanced XLR Audio Output", "direction": "output", "connector": "XLR", "channels": null, "attributes": null},
           {"name": "Balanced 1/4\" (6.35 mm) TRS Audio Output", "direction": "output", "connector": "1/4\" TRS", "channels": null, "attributes": null}
         ],
@@ -84,13 +83,13 @@
       "signal_flow": {
         "ports": [
           {"name": "Analog Input", "direction": "input", "connector": "XLR", "channels": 16, "attributes": ["balanced"]},
-          {"name": "Stereo Input", "direction": "input", "connector": "3.5mm", "channels": 2, "attributes": ["unbalanced"]},
+          {"name": ".5mm Stereo Input", "direction": "input", "connector": "3.5mm", "channels": 2, "attributes": ["unbalanced"]},
+          {"name": "Local ¼\" Stereo Inputs", "direction": "input", "connector": "TRS", "channels": 2, "attributes": ["unbalanced"]},
           {"name": "Talkback", "direction": "input", "connector": "XLR", "channels": null, "attributes": ["balanced"]},
-          {"name": "Network", "direction": "input", "connector": "RJ45", "channels": null, "attributes": null},
           {"name": "SLink", "direction": "input", "connector": "RJ45", "channels": null, "attributes": ["remote_audio"]},
           {"name": "AES Digital Output", "direction": "output", "connector": "XLR", "channels": null, "attributes": ["AES_EBU"]},
           {"name": "Assignable Local Outputs", "direction": "output", "connector": "XLR", "channels": 12, "attributes": ["balanced"]},
-          {"name": "TRS Local Outputs", "direction": "output", "connector": "TRS", "channels": 2, "attributes": null},
+          {"name": "¼\" TRS Local Outputs", "direction": "output", "connector": "TRS", "channels": 2, "attributes": null},
           {"name": "Headphone", "direction": "output", "connector": "TRS", "channels": null, "attributes": ["unbalanced"]}
         ],
         "bridges": []
@@ -110,13 +109,11 @@
       "signal_flow": {
         "ports": [
           {"name": "Analog Audio Inputs", "direction": "input", "connector": "Euroblock", "channels": 8, "attributes": null},
-          {"name": "GPI", "direction": "input", "connector": "Euroblock", "channels": 16, "attributes": null},
           {"name": "FlexChannels", "direction": "input_output", "connector": "Euroblock", "channels": 8, "attributes": null},
           {"name": "Network", "direction": "input_output", "connector": "RJ45", "channels": 2, "attributes": null},
           {"name": "POTS", "direction": "input_output", "connector": "RJ11", "channels": null, "attributes": null},
           {"name": "VoIP", "direction": "input_output", "connector": "RJ45", "channels": null, "attributes": null},
-          {"name": "Analog Audio Outputs", "direction": "output", "connector": "Euroblock", "channels": 8, "attributes": null},
-          {"name": "GPO", "direction": "output", "connector": "Euroblock", "channels": 16, "attributes": null}
+          {"name": "Analog Audio Outputs", "direction": "output", "connector": "Euroblock", "channels": 8, "attributes": null}
         ],
         "bridges": []
       },

@@ -328,7 +328,7 @@ def _is_power_port(port: dict) -> bool:
 def _is_control_port(port: dict) -> bool:
     """Return True if this port is a control/data port (not an audio signal-flow port).
 
-    USB ports are control/peripheral interfaces, not audio signal paths.
+    USB ports, logic I/O, and control-only network ports are not audio signal paths.
     They should not appear in PatchLang templates.
     """
     name = (port.get("name") or "").lower()
@@ -338,7 +338,20 @@ def _is_control_port(port: dict) -> bool:
         return True
     if connector in ("usb", "usb-a", "usb_b", "usb-b", "usb_c", "usb-c"):
         return True
+    # Drop logic I/O ports (GPI/GPO, GPIO)
+    if name in ("gpi", "gpo", "gpio"):
+        return True
     return False
+
+
+# Device-specific non-signal ports that should be dropped regardless of name.
+# Keyed by canonical device key "Manufacturer:Model".
+_NON_SIGNAL_PORT_DENYLIST: dict[str, list[str]] = {
+    # SQ-5 Network is control-only (MIDI, TCP/IP). SLink is the audio expansion port.
+    "Allen & Heath:SQ-5": ["Network"],
+    # ULXD4 Network is Wireless Workbench control only, not Dante audio.
+    "Shure Incorporated:ULXD4": ["Network"],
+}
 
 
 def _drop_false_positives(ports: list[dict], device_class: str) -> list[dict]:
@@ -563,6 +576,7 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
     # Filter out non-signal ports (power mains, USB control ports, etc.)
     merged_ports = [p for p in merged_ports if not _is_power_port(p)]
     merged_ports = [p for p in merged_ports if not _is_control_port(p)]
+
     merged_ports = _drop_false_positives(merged_ports, device_class)
 
     # General connector cleanup: normalize common variants
@@ -599,6 +613,12 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
             if override_key.lower() == device_key.lower():
                 if port_name in overrides:
                     port["direction"] = overrides[port_name]
+
+    # Apply device-specific non-signal port denylist
+    denylist = _NON_SIGNAL_PORT_DENYLIST.get(device_key, [])
+    if denylist:
+        denyset = {n.lower() for n in denylist}
+        merged_ports = [p for p in merged_ports if (p.get("name") or "").strip().lower() not in denyset]
 
     # Cleanup: correct single-connector ports and strip sentence-length attributes
     for port in merged_ports:
