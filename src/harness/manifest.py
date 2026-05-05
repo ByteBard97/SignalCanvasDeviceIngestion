@@ -77,6 +77,34 @@ RECOVERY_RESTART_STAGE = "restart"
 RECOVERY_REPOLL_RAGSCALLION = "repoll"
 
 
+# Document types tracked in device_documents. Devices typically need at least
+# a spec sheet; manuals and install guides cover bridge/routing and physical
+# specs that the spec sheet often omits.
+DOC_TYPE_SPEC_SHEET = "spec_sheet"
+DOC_TYPE_USER_MANUAL = "user_manual"
+DOC_TYPE_INSTALL_GUIDE = "install_guide"
+DOC_TYPE_API_DOC = "api_doc"
+DOC_TYPE_OTHER = "other"
+
+
+@dataclass
+class DeviceDocument:
+    """One PDF associated with a device. A device may have many."""
+
+    device_id: str
+    doc_type: str
+    url: Optional[str] = None
+    local_path: Optional[str] = None
+    ragscallion_job_id: Optional[str] = None
+    indexed_at: Optional[str] = None
+    id: Optional[int] = None
+    created_at: Optional[str] = None
+
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = datetime.now().isoformat()
+
+
 @dataclass
 class DeviceNode:
     """Persistent storage model for device ingestion state with crash recovery."""
@@ -299,7 +327,52 @@ class Manifest:
                 "CREATE INDEX IF NOT EXISTS idx_usage_log_stage ON usage_log(stage)"
             )
 
+            # Per-device document set. Each device may have many PDFs (spec sheet,
+            # user manual, install guide, etc.). The pdf_url/pdf_path columns on
+            # device_nodes remain as the "primary" doc for backward compat; this
+            # table is the source of truth for the full coverage set.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS device_documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    doc_type TEXT NOT NULL,
+                    url TEXT,
+                    local_path TEXT,
+                    ragscallion_job_id TEXT,
+                    indexed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(device_id, doc_type, url)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_device_documents_device ON device_documents(device_id)"
+            )
+
+            self._backfill_device_documents(conn)
+
             conn.commit()
+
+    def _backfill_device_documents(self, conn: sqlite3.Connection):
+        """One-time backfill: copy each device's existing pdf_url/pdf_path into
+        device_documents as a spec_sheet row, if not already present."""
+        rows = conn.execute(
+            "SELECT device_id, pdf_url, pdf_path FROM device_nodes "
+            "WHERE pdf_url IS NOT NULL OR pdf_path IS NOT NULL"
+        ).fetchall()
+        now = datetime.now().isoformat()
+        for device_id, pdf_url, pdf_path in rows:
+            existing = conn.execute(
+                "SELECT 1 FROM device_documents WHERE device_id = ? AND doc_type = ?",
+                (device_id, DOC_TYPE_SPEC_SHEET),
+            ).fetchone()
+            if existing:
+                continue
+            conn.execute(
+                "INSERT INTO device_documents "
+                "(device_id, doc_type, url, local_path, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (device_id, DOC_TYPE_SPEC_SHEET, pdf_url, pdf_path, now),
+            )
 
     def _recover_from_crash(self):
         """Recover incomplete nodes from crash on startup.
@@ -463,6 +536,17 @@ class Manifest:
                 return None
             return self._row_to_node(row)
 
+    def get_node_by_corpus_id(self, corpus_id: str) -> Optional[DeviceNode]:
+        """Retrieve a device node by its Ragscallion corpus ID."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM device_nodes WHERE corpus_id = ?",
+                (corpus_id,)
+            ).fetchone()
+            if not row:
+                return None
+            return self._row_to_node(row)
+
     def list_by_queue(self, queue: int) -> list[DeviceNode]:
         """List all nodes in a specific queue."""
         with sqlite3.connect(self.db_path) as conn:
@@ -600,6 +684,103 @@ class Manifest:
                 "failed": failed,
                 "stages_completed": stage_counts,
             }
+
+
+    def add_document(
+        self,
+        device_id: str,
+        doc_type: str,
+        *,
+        url: Optional[str] = None,
+        local_path: Optional[str] = None,
+        ragscallion_job_id: Optional[str] = None,
+    ) -> DeviceDocument:
+        """Attach a PDF to a device. Idempotent on (device_id, doc_type, url)."""
+        doc = DeviceDocument(
+            device_id=device_id,
+            doc_type=doc_type,
+            url=url,
+            local_path=local_path,
+            ragscallion_job_id=ragscallion_job_id,
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO device_documents "
+                "(device_id, doc_type, url, local_path, ragscallion_job_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (doc.device_id, doc.doc_type, doc.url, doc.local_path,
+                 doc.ragscallion_job_id, doc.created_at),
+            )
+            conn.commit()
+            doc.id = cur.lastrowid
+        return doc
+
+    def list_documents(
+        self,
+        device_id: str,
+        doc_type: Optional[str] = None,
+    ) -> list[DeviceDocument]:
+        """All PDFs for a device, optionally filtered by doc_type."""
+        with sqlite3.connect(self.db_path) as conn:
+            if doc_type is None:
+                rows = conn.execute(
+                    "SELECT id, device_id, doc_type, url, local_path, "
+                    "ragscallion_job_id, indexed_at, created_at "
+                    "FROM device_documents WHERE device_id = ? ORDER BY id",
+                    (device_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, device_id, doc_type, url, local_path, "
+                    "ragscallion_job_id, indexed_at, created_at "
+                    "FROM device_documents WHERE device_id = ? AND doc_type = ? "
+                    "ORDER BY id",
+                    (device_id, doc_type),
+                ).fetchall()
+        return [
+            DeviceDocument(
+                id=r[0], device_id=r[1], doc_type=r[2], url=r[3],
+                local_path=r[4], ragscallion_job_id=r[5],
+                indexed_at=r[6], created_at=r[7],
+            )
+            for r in rows
+        ]
+
+    def mark_document_indexed(
+        self,
+        doc_id: int,
+        ragscallion_job_id: Optional[str] = None,
+    ) -> None:
+        """Stamp a document as indexed and optionally record its job id."""
+        with sqlite3.connect(self.db_path) as conn:
+            if ragscallion_job_id is None:
+                conn.execute(
+                    "UPDATE device_documents SET indexed_at = ? WHERE id = ?",
+                    (datetime.now().isoformat(), doc_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE device_documents SET indexed_at = ?, ragscallion_job_id = ? "
+                    "WHERE id = ?",
+                    (datetime.now().isoformat(), ragscallion_job_id, doc_id),
+                )
+            conn.commit()
+
+    def set_document_local_path(
+        self,
+        device_id: str,
+        doc_type: str,
+        url: str,
+        local_path: str,
+    ) -> None:
+        """Update the local_path of a matching device document."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE device_documents SET local_path = ? "
+                "WHERE device_id = ? AND doc_type = ? AND url = ?",
+                (local_path, device_id, doc_type, url),
+            )
+            conn.commit()
 
 
 # Backwards-compatibility alias for existing code

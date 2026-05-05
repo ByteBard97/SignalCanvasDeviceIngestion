@@ -7,6 +7,8 @@ Stages use constants for queue IDs and stage codes (no magic numbers).
 import asyncio
 import json
 import logging
+import re
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -25,6 +27,7 @@ from .harness.manifest import (
     STAGE_INDEX_RAG,
     STAGE_EXTRACT_SPECS,
     STAGE_RESOLVE_SKU,
+    DOC_TYPE_SPEC_SHEET,
 )
 from .ragscallion_client import (
     RagscallionClient,
@@ -79,10 +82,19 @@ def _model_tokens(model: str) -> list[str]:
     raw = re.split(r"[^A-Za-z0-9]+", model)
     tokens: list[str] = []
     for chunk in raw:
-        # Split letter→digit and digit→letter transitions
+        # Keep the chunk itself as a token (handles short codes like H6, X32)
+        if len(chunk) >= _MODEL_TOKEN_MIN_LEN:
+            tokens.append(chunk)
+        # Also split letter→digit and digit→letter transitions
         for sub in re.findall(r"[A-Za-z]+|[0-9]+", chunk):
             tokens.append(sub)
-    return [t for t in tokens if len(t) >= _MODEL_TOKEN_MIN_LEN]
+    result = [t for t in tokens if len(t) >= _MODEL_TOKEN_MIN_LEN]
+    # Fallback: if nothing survived, try the stripped model name as one token
+    if not result:
+        stripped = re.sub(r"[^A-Za-z0-9]", "", model)
+        if stripped:
+            result.append(stripped)
+    return result
 
 
 def _looks_opaque(slug: str) -> bool:
@@ -146,6 +158,160 @@ def _resolved_sku(node: DeviceNode) -> str:
     Centralizing this avoids every later stage having to know whether resolution happened.
     """
     return node.canonical_sku or node.model
+
+
+# Lazy-loaded AV-iQ lookup table: {(manufacturer_lower, model_lower): pdf_url}
+_av_iq_lookup: dict[tuple[str, str], str] | None = None
+
+
+def _load_av_iq_lookup() -> dict[tuple[str, str], str]:
+    """Load AV-iQ matches from scanner output."""
+    global _av_iq_lookup
+    if _av_iq_lookup is not None:
+        return _av_iq_lookup
+
+    lookup: dict[tuple[str, str], str] = {}
+    av_iq_path = Path("output/av_iq_matches.json")
+    if av_iq_path.exists():
+        try:
+            with open(av_iq_path) as f:
+                data = json.load(f)
+            for match in data.get("matches", []):
+                mfg = match.get("manufacturer", "").strip().lower()
+                name = match.get("name", "").strip().lower()
+                url = match.get("av_iq_url", "").strip()
+                if mfg and name and url:
+                    lookup[(mfg, name)] = url
+            logger.info(f"Loaded {len(lookup)} AV-iQ matches from {av_iq_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load AV-iQ matches: {e}")
+    else:
+        logger.info(f"AV-iQ matches file not found at {av_iq_path}")
+
+    _av_iq_lookup = lookup
+    return lookup
+
+
+def _av_iq_url_for_device(manufacturer: str, model: str) -> Optional[str]:
+    """Return a known AV-iQ datasheet URL if one exists for this device.
+
+    Matching is fuzzy to handle naming variations:
+    - "SHURE" / "Shure" (case)
+    - "Mix console XR18" / "XR 18" (extra words, spaces)
+    - "SD8 8-channel Stage Box" / "SD8" (subset)
+    """
+    lookup = _load_av_iq_lookup()
+    mfg_key = manufacturer.strip().lower()
+    model_key = model.strip().lower()
+    model_key_norm = model_key.replace(" ", "")
+
+    # Exact match
+    if (mfg_key, model_key) in lookup:
+        return lookup[(mfg_key, model_key)]
+
+    # Try each AV-iQ entry
+    for (lk_mfg, lk_model), url in lookup.items():
+        # Manufacturer must match (case-insensitive)
+        if lk_mfg != mfg_key:
+            continue
+        lk_norm = lk_model.replace(" ", "")
+        # Model exact match
+        if lk_model == model_key:
+            return url
+        # Normalized match ("XR 18" vs "XR18")
+        if lk_norm == model_key_norm:
+            return url
+        # Subset match: AV-iQ model contained in manifest model
+        # e.g. "SD8" contained in "SD8 8-channel Stage Box"
+        if lk_norm in model_key_norm or model_key_norm in lk_norm:
+            return url
+
+    return None
+
+
+async def _search_duckduckgo_for_pdf(
+    manufacturer: str,
+    model: str,
+    rejected_urls: list[str],
+) -> Optional[str]:
+    """Fallback web search via DuckDuckGo HTML endpoint.
+
+    Searches for ``{manufacturer} {model} pdf`` and returns the first
+    candidate URL that:
+    - ends in ``.pdf`` (or returns ``application/pdf`` on HEAD)
+    - passes ``_url_likely_matches_model``
+    - is not in *rejected_urls*
+
+    Returns ``None`` if no valid PDF is found.
+    """
+    import httpx
+
+    query = f'{manufacturer} {model} pdf'
+    search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(search_url, headers=headers)
+            resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"DDG search failed for {manufacturer} {model}: {e}")
+        return None
+
+    # DuckDuckGo wraps results in redirect URLs like:
+    #   //duckduckgo.com/l/?uddg=<url-encoded-target>&rut=...
+    redirect_links = re.findall(
+        r'//duckduckgo\.com/l/\?uddg=([^&"\s]+)',
+        resp.text,
+    )
+
+    candidates: list[str] = []
+    for encoded in redirect_links:
+        try:
+            decoded = urllib.parse.unquote(encoded)
+        except Exception:
+            continue
+        if not decoded.lower().endswith(".pdf"):
+            continue
+        if decoded in rejected_urls:
+            continue
+        candidates.append(decoded)
+
+    # Also look for direct .pdf links in the raw HTML
+    direct_links = re.findall(
+        r'href="(https?://[^"]+\.pdf)"',
+        resp.text,
+        flags=re.IGNORECASE,
+    )
+    for link in direct_links:
+        if link in rejected_urls or link in candidates:
+            continue
+        candidates.append(link)
+
+    if not candidates:
+        logger.info(f"DDG search for {manufacturer} {model}: no .pdf candidates")
+        return None
+
+    logger.info(
+        f"DDG search for {manufacturer} {model}: {len(candidates)} candidate(s)"
+    )
+
+    for url in candidates:
+        # Content-type validation for non-.pdf endings (rare here, but keep parity)
+        if not url.lower().endswith(".pdf"):
+            is_pdf = await _verify_pdf_content_type(url)
+            if not is_pdf:
+                logger.debug(f"DDG candidate rejected (non-PDF): {url}")
+                continue
+
+        if not _url_likely_matches_model(url, model):
+            logger.debug(f"DDG candidate rejected (model mismatch): {url}")
+            continue
+
+        logger.info(f"DDG fallback found valid PDF: {url}")
+        return url
+
+    return None
 
 
 def _build_fallback_url_prompt(
@@ -213,6 +379,22 @@ async def stage_0_resolve_sku(
     if node.canonical_sku:
         return True
 
+    # Fast-path: if the model already looks like a canonical SKU, skip the
+    # expensive Kimi CLI call. Heuristic: contains a digit + letter, or is
+    # short with uppercase letters (common for pro-audio gear like "CL1",
+    # "ATEM Mini Extreme ISO", "EW 100 G4").
+    model = node.model
+    has_digit = any(c.isdigit() for c in model)
+    has_upper = any(c.isupper() for c in model)
+    has_letter = any(c.isalpha() for c in model)
+    if (has_digit and has_letter) or (has_upper and len(model) <= 30):
+        node.canonical_sku = model
+        node.canonical_product_name = model
+        node.stage_resolve_sku = STAGE_COMPLETED
+        manifest.persist(node)
+        logger.info(f"Device {node.device_id} fast-path SKU resolution: {model!r}")
+        return True
+
     async with RESOLVE_SKU_SEMAPHORE:
         from .kimi_runner import run_kimi, extract_json_block
 
@@ -221,17 +403,24 @@ async def stage_0_resolve_sku(
 
         prompt = _build_resolve_sku_prompt(node.manufacturer, node.model)
 
-        try:
-            stdout = await run_kimi(
-                prompt,
-                skills_dir=skills_dir,
-                work_dir=repo_root,
-                timeout=RESOLVE_SKU_TIMEOUT_SECONDS,
-                max_steps=RESOLVE_SKU_MAX_STEPS,
-            )
-        except Exception as e:
-            logger.error(f"Device {node.device_id} Stage 0 Kimi invocation failed: {e}")
-            stdout = None
+        stdout = None
+        for attempt in range(2):
+            try:
+                stdout = await run_kimi(
+                    prompt,
+                    skills_dir=skills_dir,
+                    work_dir=repo_root,
+                    timeout=RESOLVE_SKU_TIMEOUT_SECONDS * (attempt + 1),
+                    max_steps=RESOLVE_SKU_MAX_STEPS,
+                )
+                if stdout:
+                    break
+            except Exception as e:
+                logger.error(
+                    f"Device {node.device_id} Stage 0 Kimi invocation failed "
+                    f"(attempt {attempt + 1}): {e}"
+                )
+                stdout = None
 
         if not stdout:
             _set_stage_failure(
@@ -321,6 +510,21 @@ async def stage_1_find_pdf(
         - Persists node to manifest
     """
     async with FIND_PDF_SEMAPHORE:
+        # Check structured sources first — skip agentic search if we already
+        # know the PDF URL.
+        av_iq_url = _av_iq_url_for_device(node.manufacturer, node.model)
+        if av_iq_url:
+            logger.info(
+                f"Device {node.device_id}: AV-iQ match found, skipping agentic search"
+            )
+            node.pdf_url = av_iq_url
+            node.stage_find_pdf = STAGE_COMPLETED
+            manifest.add_document(
+                node.device_id, DOC_TYPE_SPEC_SHEET, url=av_iq_url
+            )
+            manifest.persist(node)
+            return True
+
         from .kimi_runner import run_kimi, extract_json_block
 
         repo_root = Path(__file__).resolve().parent.parent
@@ -374,7 +578,13 @@ async def stage_1_find_pdf(
                     rejected_urls.append(pdf_url)
                     continue
 
-            if not _url_likely_matches_model(pdf_url, sku_for_search):
+            # Validate URL against both SKU and model name. Some manufacturers
+            # use internal SKUs (e.g. SWRCONVRCK2) that never appear in PDF
+            # filenames; the model name (e.g. "ATEM Studio Converter 2") is
+            # what actually shows up in URLs.
+            if not _url_likely_matches_model(
+                pdf_url, sku_for_search
+            ) and not _url_likely_matches_model(pdf_url, node.model):
                 last_failure_message = (
                     f"URL filename does not match model {sku_for_search}: {pdf_url}"
                 )
@@ -386,8 +596,30 @@ async def stage_1_find_pdf(
 
             node.pdf_url = pdf_url
             node.stage_find_pdf = STAGE_COMPLETED
+            manifest.add_document(
+                node.device_id, DOC_TYPE_SPEC_SHEET, url=pdf_url
+            )
             manifest.persist(node)
             logger.info(f"Device {node.device_id} PDF URL found (attempt {attempt}): {pdf_url}")
+            return True
+
+        # Fallback: try DuckDuckGo direct search if Kimi CLI couldn't find anything.
+        # Use the human-readable model name, not the canonical SKU — web search
+        # engines don't know internal SKUs like SWRCONVRCK2.
+        logger.info(
+            f"Device {node.device_id} Kimi search exhausted; trying DDG fallback"
+        )
+        ddg_url = await _search_duckduckgo_for_pdf(
+            node.manufacturer, node.model, rejected_urls
+        )
+        if ddg_url:
+            node.pdf_url = ddg_url
+            node.stage_find_pdf = STAGE_COMPLETED
+            manifest.add_document(
+                node.device_id, DOC_TYPE_SPEC_SHEET, url=ddg_url
+            )
+            manifest.persist(node)
+            logger.info(f"Device {node.device_id} PDF URL found via DDG fallback: {ddg_url}")
             return True
 
         _set_stage_failure(
@@ -401,12 +633,23 @@ async def stage_1_find_pdf(
         return False
 
 
+# Shared browser-like headers for requests that need to look like a real user
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/pdf,*/*;q=0.9",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
 async def _verify_pdf_content_type(url: str) -> bool:
     """Verify that a URL returns application/pdf via HEAD request."""
     try:
         import httpx
         async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-            resp = await client.head(url)
+            resp = await client.head(url, headers=_BROWSER_HEADERS)
             content_type = resp.headers.get("content-type", "").lower()
             return "pdf" in content_type
     except Exception as e:
@@ -469,7 +712,13 @@ async def stage_2_download_pdf(
                 async with httpx.AsyncClient(
                     follow_redirects=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
                 ) as client:
-                    resp = await client.get(current_url)
+                    resp = await client.get(
+                        current_url,
+                        headers={
+                            **_BROWSER_HEADERS,
+                            "Referer": f"https://www.google.com/search?q={urllib.parse.quote(current_url)}",
+                        },
+                    )
                     resp.raise_for_status()
             except httpx.HTTPStatusError as e:
                 # Server reached, returned 4xx/5xx. Don't waste a fallback on this —
@@ -532,6 +781,12 @@ async def stage_2_download_pdf(
             node.pdf_url = current_url
             node.pdf_path = str(pdf_path)
             node.stage_download_pdf = STAGE_COMPLETED
+            manifest.set_document_local_path(
+                node.device_id,
+                DOC_TYPE_SPEC_SHEET,
+                current_url,
+                str(pdf_path),
+            )
             manifest.persist(node)
             logger.info(
                 f"Device {node.device_id} PDF downloaded to {pdf_path} ({len(content)} bytes)"
@@ -687,8 +942,8 @@ async def stage_3_4_submit_to_ragscallion(
         - Persists node to manifest
         - Logs submission result
     """
-    corpus_id = node.device_id  # e.g., "yamaha-r08d"
-    source_label = f"{node.manufacturer} {node.model}"
+    corpus_id = node.corpus_id  # Use sanitized corpus_id (may differ from device_id)
+    source_label = f"{node.manufacturer} {node.model} ({node.device_id})"
 
     try:
         # Submit PDF to Ragscallion with retry logic handled by client
@@ -714,18 +969,40 @@ async def stage_3_4_submit_to_ragscallion(
         return True
 
     except RagscallionCollisionError as e:
-        # source_label already exists in corpus → manual review required
-        node.failure_stage = STAGE_INDEX_RAG
-        node.failure_category = FailureCategory.RAGDB_COLLISION.value
-        node.failure_message = f"source_label '{source_label}' already in corpus '{corpus_id}'"
-        node.failure_retryable = False
-        node.failure_attempts += 1
-        node.failure_at = datetime.now(timezone.utc).isoformat()
-        node.queue = QUEUE_4_MANUAL_REVIEW
-        node.stage_index_rag = STAGE_FAILED
-        manifest.persist(node)
-        logger.error(f"Device {node.device_id} collision: {e}")
-        return False
+        # source_label already exists in corpus → retry with replace
+        logger.warning(
+            f"Device {node.device_id} collision: {e}. Retrying with on_conflict=replace..."
+        )
+        try:
+            job = await ragscallion_client.submit_ingest(
+                pdf_path=node.pdf_path,
+                corpus_id=corpus_id,
+                source_label=source_label,
+                on_conflict="replace",
+            )
+            node.ragscallion_job_id = job["job_id"]
+            node.corpus_id = corpus_id
+            node.ragscallion_submitted_at = datetime.now(timezone.utc).isoformat()
+            node.stage_convert_marker = STAGE_IN_PROGRESS
+            node.stage_index_rag = STAGE_IN_PROGRESS
+            node.queue = QUEUE_2_POLLING_RAGSCALLION
+            manifest.persist(node)
+            logger.info(
+                f"Device {node.device_id} re-submitted to Ragscallion (replace), job_id={job['job_id']}"
+            )
+            return True
+        except Exception as retry_e:
+            node.failure_stage = STAGE_INDEX_RAG
+            node.failure_category = FailureCategory.RAGDB_COLLISION.value
+            node.failure_message = f"Collision retry failed: {retry_e}"
+            node.failure_retryable = False
+            node.failure_attempts += 1
+            node.failure_at = datetime.now(timezone.utc).isoformat()
+            node.queue = QUEUE_4_MANUAL_REVIEW
+            node.stage_index_rag = STAGE_FAILED
+            manifest.persist(node)
+            logger.error(f"Device {node.device_id} collision retry failed: {retry_e}")
+            return False
 
     except RagscallionUnavailableError as e:
         # Ragscallion unavailable after 3 retries
@@ -907,9 +1184,19 @@ async def _extract_specs_via_agent(
         timeout=EXTRACTION_TIMEOUT_SECONDS,
     )
     if stdout is None:
+        logger.warning(f"Extraction for {manufacturer} {model}: Kimi returned no output")
+        return None
+    if not stdout.strip():
+        logger.warning(f"Extraction for {manufacturer} {model}: Kimi returned empty stdout")
         return None
 
     json_block = extract_json_block(stdout)
+    if not json_block:
+        logger.warning(
+            f"Extraction for {manufacturer} {model}: no JSON block in stdout. "
+            f"First 500 chars: {stdout[:500]!r}"
+        )
+        return None
     return json_block
 
 
@@ -949,6 +1236,12 @@ async def process_stage_5_batch(
     """
     # Get all nodes ready for extraction (queue_3)
     nodes = manifest.list_by_queue(QUEUE_3_READY_FOR_EXTRACTION)
+    # Also retry queue_4 nodes that failed extraction but are retryable
+    retry_nodes = [
+        n for n in manifest.list_by_queue(QUEUE_4_MANUAL_REVIEW)
+        if n.stage_extract_specs == STAGE_FAILED and n.failure_retryable
+    ]
+    nodes = list({n.device_id: n for n in nodes + retry_nodes}.values())
 
     if not nodes:
         logger.info("No nodes in queue_3 (ready for extraction)")
