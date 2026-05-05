@@ -694,17 +694,14 @@ async def _download_secondary_docs(
 
         local_path = cache_dir / f"{node.device_id}__{doc.doc_type}.pdf"
         content: bytes | None = None
+        headers = _download_headers(
+            doc.url, manufacturer=node.manufacturer, model=node.model
+        )
         try:
             async with httpx.AsyncClient(
                 follow_redirects=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
             ) as client:
-                resp = await client.get(
-                    doc.url,
-                    headers={
-                        **_BROWSER_HEADERS,
-                        "Referer": f"https://www.google.com/search?q={urllib.parse.quote(doc.url)}",
-                    },
-                )
+                resp = await client.get(doc.url, headers=headers)
                 resp.raise_for_status()
                 content = resp.content
         except Exception as e:
@@ -719,13 +716,7 @@ async def _download_secondary_docs(
                         timeout=DOWNLOAD_TIMEOUT_SECONDS,
                         verify=False,
                     ) as client:
-                        resp = await client.get(
-                            doc.url,
-                            headers={
-                                **_BROWSER_HEADERS,
-                                "Referer": f"https://www.google.com/search?q={urllib.parse.quote(doc.url)}",
-                            },
-                        )
+                        resp = await client.get(doc.url, headers=headers)
                         resp.raise_for_status()
                         content = resp.content
                 except Exception as inner:
@@ -756,7 +747,9 @@ async def _download_secondary_docs(
         )
 
 
-# Shared browser-like headers for requests that need to look like a real user
+# Shared browser-like headers for requests that need to look like a real user.
+# Sec-Fetch-* headers make the request look like it originated from a real
+# browser following a link (not a direct fetch by a script).
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -764,15 +757,37 @@ _BROWSER_HEADERS = {
     ),
     "Accept": "application/pdf,*/*;q=0.9",
     "Accept-Language": "en-US,en;q=0.9",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-User": "?1",
 }
+
+
+def _download_headers(url: str, manufacturer: str = "", model: str = "") -> dict[str, str]:
+    """Return request headers that look like a real browser following a search result.
+
+    The Referer points to a Google search for the device model instead of a
+    generic or self-referential URL, which some bot filters flag.
+    """
+    query = urllib.parse.quote(f"{manufacturer} {model} datasheet pdf".strip())
+    return {
+        **_BROWSER_HEADERS,
+        "Referer": f"https://www.google.com/search?q={query}",
+    }
 
 
 async def _verify_pdf_content_type(url: str) -> bool:
     """Verify that a URL returns application/pdf via HEAD request."""
     import httpx
+    headers = _download_headers(url)
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-            resp = await client.head(url, headers=_BROWSER_HEADERS)
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=10.0
+        ) as client:
+            resp = await client.head(url, headers=headers)
             content_type = resp.headers.get("content-type", "").lower()
             return "pdf" in content_type
     except Exception as e:
@@ -782,7 +797,7 @@ async def _verify_pdf_content_type(url: str) -> bool:
                 async with httpx.AsyncClient(
                     follow_redirects=True, timeout=10.0, verify=False
                 ) as client:
-                    resp = await client.head(url, headers=_BROWSER_HEADERS)
+                    resp = await client.head(url, headers=headers)
                     content_type = resp.headers.get("content-type", "").lower()
                     return "pdf" in content_type
             except Exception as inner:
@@ -841,36 +856,33 @@ async def stage_2_download_pdf(
         last_error = "no attempts made"
 
         async def _try_download(url: str) -> bytes:
-            """Download PDF bytes, transparently retrying with verify=False on SSL errors."""
+            """Download PDF bytes, transparently retrying with verify=False on SSL errors.
+
+            Uses a single httpx client so cookies (if any) persist across the
+            normal → SSL-fallback retry path.
+            """
             import httpx
-            headers = {
-                **_BROWSER_HEADERS,
-                "Referer": f"https://www.google.com/search?q={urllib.parse.quote(url)}",
-            }
-            try:
-                async with httpx.AsyncClient(
-                    follow_redirects=True,
-                    timeout=DOWNLOAD_TIMEOUT_SECONDS,
-                    verify=True,
-                ) as client:
+            headers = _download_headers(
+                url, manufacturer=node.manufacturer, model=node.model
+            )
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=DOWNLOAD_TIMEOUT_SECONDS,
+            ) as client:
+                try:
                     r = await client.get(url, headers=headers)
                     r.raise_for_status()
                     return r.content
-            except Exception as e:
-                if _is_ssl_error(e):
-                    logger.warning(
-                        f"Device {node.device_id} SSL verify failed for {url}, "
-                        f"retrying with verify=False"
-                    )
-                    async with httpx.AsyncClient(
-                        follow_redirects=True,
-                        timeout=DOWNLOAD_TIMEOUT_SECONDS,
-                        verify=False,
-                    ) as client:
-                        r = await client.get(url, headers=headers)
+                except Exception as e:
+                    if _is_ssl_error(e):
+                        logger.warning(
+                            f"Device {node.device_id} SSL verify failed for {url}, "
+                            f"retrying with verify=False"
+                        )
+                        r = await client.get(url, headers=headers, verify=False)
                         r.raise_for_status()
                         return r.content
-                raise
+                    raise
 
         for attempt in range(1 + DOWNLOAD_FALLBACK_ATTEMPTS):
             tried_urls.append(current_url)
