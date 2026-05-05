@@ -50,7 +50,9 @@ Polling loop refactored: per-job processing extracted into `_process_job_result(
 
 New tests: `tests/test_pipeline_stages.py::TestStage34MultiDocSubmission` (multi-doc submit + secondary failure tolerance), `tests/test_polling_loop.py::TestProcessJobResult` (spec_sheet ready advances node, secondary ready doesn't, secondary failure doesn't fail node).
 
-**Validation gap:** Phase B and Phase C are shipped on logic + unit tests only. Before declaring extraction-ready, run one real device end-to-end and confirm: `device_documents` has 1–3 rows with `local_path` and `ragscallion_job_id` set; node advances to queue_3 as soon as spec_sheet `indexed_at` is stamped (does not wait for secondaries); secondary docs' `indexed_at` populates as their jobs finish.
+**Shakedown done (2026-05-05):** Ran `Shure|QLXD4|shure-qlxd4-phasec` end-to-end against real Ragscallion. Device reached queue_5 with specs_json + patch_source populated. `device_documents` has 3 rows (spec_sheet + user_manual + install_guide); both secondaries fully populated with local_path, ragscallion_job_id, indexed_at; node advanced to queue_3 immediately when spec_sheet ready (00:06:32) without waiting on secondaries that completed earlier. One bug found and fixed (commit 376f9c2): when Stage 2's first download fails and `_request_alternate_pdf_url` returns a different working URL, `set_document_local_path` was a strict UPDATE-by-URL and silently no-op'd because no row existed for the fallback URL — leaving the spec_sheet audit row incomplete. Fix: insert-or-ignore the working URL via `add_document` before the UPDATE. Note: device-level flow still worked because `_process_job_result` falls back to `node.ragscallion_job_id` when no doc row matches by job_id.
+
+**Known minor:** Shure publishes one combined "user guide" used as both user_manual AND install_guide. Phase B's two parallel Kimi searches found the same URL, both downloaded, both submitted as separate Ragscallion jobs — wasted indexing. Not a bug; future optimization could dedupe by URL before submission.
 
 ## Key files
 - `src/harness/manifest.py` — schema + CRUD
@@ -72,7 +74,7 @@ New tests: `tests/test_pipeline_stages.py::TestStage34MultiDocSubmission` (multi
 - **Ragscallion:** server runs at `192.168.0.200:8086` on a Linux box (Geoff has SSH as `your-username@localhost`). Vector store. Schema-flexible — already accepts arbitrary `submit_ingest` calls; multi-doc per device key works server-side without changes.
 
 ## Tasks (state at handoff)
-1-2 completed (Stage 1/2 wiring), 3 deleted (superseded by 6), 4 completed-with-note (Phase A abandoned), 5 completed (Phase B), 6 completed-pending-validation (Phase C — needs one real-device shakedown), 7-10 completed (D+E plus reviewer fixes).
+1-2 completed (Stage 1/2 wiring), 3 deleted (superseded by 6), 4 completed-with-note (Phase A abandoned), 5 completed (Phase B), 6 completed-and-validated (Phase C — real-device shakedown 2026-05-05 caught and fixed one audit bug), 7-10 completed (D+E plus reviewer fixes).
 
 ## Last advisor feedback worth keeping
 - For Phase C, partial-failure semantics: spec_sheet must succeed for stage_index_rag = COMPLETED; secondaries are best-effort (mirrors Phase B).
