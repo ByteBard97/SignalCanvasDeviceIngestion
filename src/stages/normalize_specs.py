@@ -526,10 +526,20 @@ def _normalize_bridges(raw_bridges: list[str]) -> list[str]:
 
 
 def apply_bridge_heuristics(extracted: dict, device_class: str) -> dict:
-    """Replace LLM bridges with deterministic class-specific heuristics."""
+    """Augment LLM bridges with deterministic class-specific heuristics.
+
+    Only overwrites bridges when the device_class has an explicit heuristic
+    entry (including an empty list).  For unknown classes, preserves the
+    LLM-extracted bridges unchanged.
+    """
     signal_flow = extracted.setdefault("signal_flow", {})
     ports = signal_flow.get("ports") or []
-    heuristics = _BRIDGE_HEURISTICS.get(device_class, [])
+
+    # If this class has no heuristic entry at all, keep LLM bridges as-is.
+    if device_class not in _BRIDGE_HEURISTICS:
+        return extracted
+
+    heuristics = _BRIDGE_HEURISTICS[device_class]
     new_bridges: list[str] = []
 
     for src_pat, dst_pat in heuristics:
@@ -624,6 +634,27 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
     for port in merged_ports:
         _correct_channels(port)
         port["attributes"] = _clean_attributes(port.get("attributes"))
+
+    # Sanitize false "Dante" labels — the LLM defaults to Dante for every RJ45 port
+    for port in merged_ports:
+        attrs = port.get("attributes") or []
+        name = (port.get("name") or "").lower()
+        conn = (port.get("connector") or "").lower()
+        if "dante" in [a.lower() for a in attrs]:
+            # If the port name clearly indicates another protocol, swap it
+            if "aes50" in name:
+                attrs = ["AES50" if a.lower() == "dante" else a for a in attrs]
+            elif "madi" in name:
+                attrs = ["MADI" if a.lower() == "dante" else a for a in attrs]
+            elif "ultranet" in name:
+                attrs = ["Ultranet" if a.lower() == "dante" else a for a in attrs]
+            elif "avb" in name:
+                attrs = ["AVB" if a.lower() == "dante" else a for a in attrs]
+            # If the document didn't explicitly mention Dante (no "dante" in chunks)
+            # and the connector is generic network, fall back to "Network"
+            elif conn in ("rj45", "ethercon", "ethernet"):
+                attrs = ["Network" if a.lower() == "dante" else a for a in attrs]
+            port["attributes"] = attrs
 
     signal_flow["ports"] = merged_ports
     signal_flow["bridges"] = deduped_bridges

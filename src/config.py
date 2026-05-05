@@ -22,8 +22,9 @@ class Settings(BaseSettings):
     ragscallion_ssh_host: str = "192.168.0.200"
     ragscallion_script_path: str = "~/projects/device-library-rag/scripts/add-paper.sh"
 
-    # Claude API
+    # API keys
     claude_api_key: str = ""  # Set from environment
+    moonshot_api_key: str = ""  # Set from environment
 
     # Ingestion phases
     phase_0_device_count: int = 3  # Validation phase
@@ -41,8 +42,10 @@ class Settings(BaseSettings):
     marker_max_memory_gb: int = 8
 
     class Config:
-        env_file = ".env"
+        # Use repo-relative path so .env is found regardless of CWD
+        env_file = str(Path(__file__).parent.parent / ".env")
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
     def ensure_output_dirs(self):
         """Create all required output directories."""

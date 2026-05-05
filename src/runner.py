@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +36,7 @@ from .harness.manifest import (
     STAGE_INDEX_RAG,
     STAGE_EXTRACT_SPECS,
 )
+from .pipeline_stages import STAGE_NOT_STARTED
 from .pipeline_stages import (
     stage_0_resolve_sku,
     stage_1_find_pdf,
@@ -187,6 +190,12 @@ async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
         n for n in manifest.list_by_queue(QUEUE_5_COMPLETED)
         if n.stage_generate_patch == 0 and n.specs_json
     ]
+    # Also retry queue_4 nodes that failed Stage 6-7 but are retryable
+    retry_nodes = [
+        n for n in manifest.list_by_queue(QUEUE_4_MANUAL_REVIEW)
+        if n.stage_generate_patch == 0 and n.specs_json and n.failure_retryable
+    ]
+    nodes = list({n.device_id: n for n in nodes + retry_nodes}.values())
     if not nodes:
         return {"successful": 0, "failed": 0}
 
@@ -197,6 +206,16 @@ async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
     for node in nodes:
         try:
             extracted = json.loads(node.specs_json)
+
+            # Warn on low-confidence extractions — often means the PDF was a
+            # marketing brochure rather than a technical manual.
+            confidence = extracted.get("extraction_confidence", "").lower()
+            if confidence == "low":
+                logger.warning(
+                    f"Device {node.device_id}: extraction confidence is LOW — "
+                    f"the PDF may be a marketing brochure. Consider re-searching."
+                )
+
             classification = await classify(node.manufacturer, node.model)
             normalized = normalize_extraction(extracted, classification.class_)
             patch_source = generate_patch(normalized)
@@ -260,11 +279,17 @@ def _create_nodes(
     """Create and persist DeviceNodes for each device."""
     nodes: list[DeviceNode] = []
     for manufacturer, model, device_id in devices:
+        # Ragscallion corpus_id must match ^[a-z0-9][a-z0-9_-]{0,63}$
+        # Sanitize: lowercase, replace invalid chars with underscore, truncate.
+        corpus_id = re.sub(r"[^a-z0-9_-]", "_", device_id.lower())[:64]
+        if corpus_id and not re.match(r"^[a-z0-9]", corpus_id):
+            corpus_id = "d" + corpus_id[:63]
+
         node = DeviceNode(
             device_id=device_id,
             manufacturer=manufacturer,
             model=model,
-            corpus_id=device_id,
+            corpus_id=corpus_id,
             queue=QUEUE_0_INITIAL,
         )
         if manifest.add_node(node):
@@ -342,7 +367,13 @@ async def run_pipeline(
     try:
         # Stage 0: Resolve user-facing aliases to canonical manufacturer SKUs
         queue_0_nodes = manifest.list_by_queue(QUEUE_0_INITIAL)
-        stage_0_success = await _run_stage_0_batch(manifest, queue_0_nodes)
+        # Also pick up nodes in queue_1 that failed Stage 0 and need retry
+        queue_1_pending_sku = [
+            n for n in manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
+            if n.stage_resolve_sku in (STAGE_NOT_STARTED, STAGE_FAILED)
+        ]
+        stage_0_nodes = list({n.device_id: n for n in queue_0_nodes + queue_1_pending_sku}.values())
+        stage_0_success = await _run_stage_0_batch(manifest, stage_0_nodes)
 
         # Stage 1: Find PDF URLs (only for nodes that resolved their SKU)
         # Re-load to pick up canonical_sku written by Stage 0.
@@ -351,7 +382,13 @@ async def run_pipeline(
             for n in stage_0_success
             if manifest.get_node(n.device_id) and manifest.get_node(n.device_id).canonical_sku
         ]
-        stage_1_success = await _run_stage_1_batch(manifest, stage_0_done)
+        # Also pick up nodes in queue_1 that haven't found a PDF yet
+        queue_1_pending_pdf = [
+            n for n in manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
+            if n.stage_find_pdf == STAGE_NOT_STARTED and n.canonical_sku
+        ]
+        stage_1_nodes = list({n.device_id: n for n in stage_0_done + queue_1_pending_pdf}.values())
+        stage_1_success = await _run_stage_1_batch(manifest, stage_1_nodes)
 
         # Stage 2: Download PDFs
         # Re-load nodes that completed stage 1 (queue may have changed)
@@ -360,7 +397,13 @@ async def run_pipeline(
             for n in stage_1_success
             if manifest.get_node(n.device_id) and manifest.get_node(n.device_id).stage_find_pdf == 2
         ]
-        stage_2_success = await _run_stage_2_batch(manifest, stage_1_done, cache_dir)
+        # Also pick up nodes in queue_1 that found PDF but haven't downloaded
+        queue_1_pending_download = [
+            n for n in manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
+            if n.stage_find_pdf == 2 and n.stage_download_pdf == STAGE_NOT_STARTED
+        ]
+        stage_2_nodes = list({n.device_id: n for n in stage_1_done + queue_1_pending_download}.values())
+        stage_2_success = await _run_stage_2_batch(manifest, stage_2_nodes, cache_dir)
 
         # Stage 3-4: Submit to Ragscallion
         stage_2_done = [
@@ -368,7 +411,14 @@ async def run_pipeline(
             for n in stage_2_success
             if manifest.get_node(n.device_id) and manifest.get_node(n.device_id).stage_download_pdf == 2
         ]
-        await _run_stage_34_batch(manifest, stage_2_done, ragscallion_client)
+        # Also pick up nodes already in queue_2 that haven't been submitted yet
+        # (e.g., after manifest reset or retry)
+        queue_2_pending = [
+            n for n in manifest.list_by_queue(QUEUE_2_POLLING_RAGSCALLION)
+            if n.stage_index_rag == STAGE_NOT_STARTED
+        ]
+        stage_34_nodes = list({n.device_id: n for n in stage_2_done + queue_2_pending}.values())
+        await _run_stage_34_batch(manifest, stage_34_nodes, ragscallion_client)
 
         # Wait for queue_3 nodes to appear (polling loop moves them from queue_2)
         logger.info("Waiting for Ragscallion indexing to complete...")

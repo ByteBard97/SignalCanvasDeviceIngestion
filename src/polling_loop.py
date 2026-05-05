@@ -96,7 +96,7 @@ async def run_polling_loop(
                     continue
 
                 # Retrieve node from manifest (corpus_id is source of truth)
-                node = manifest.get_node(corpus_id)
+                node = manifest.get_node_by_corpus_id(corpus_id)
                 if not node:
                     logger.warning(f"Node not found for corpus_id={corpus_id}")
                     continue
@@ -116,6 +116,17 @@ async def run_polling_loop(
                         f"Job {job.get('job_id')} ready (corpus_id={corpus_id}): "
                         f"{chunks_indexed} chunks indexed"
                     )
+                    # Warn if the corpus looks too thin — may be a marketing
+                    # brochure rather than a technical manual.
+                    try:
+                        if isinstance(chunks_indexed, int) and chunks_indexed < 10:
+                            logger.warning(
+                                f"Device {corpus_id}: only {chunks_indexed} chunks "
+                                f"indexed — likely a marketing brochure, not a "
+                                f"technical manual. Consider re-searching."
+                            )
+                    except Exception:
+                        pass
 
                 elif status == "failed":
                     # Move node from queue_2 to queue_4 (failed)

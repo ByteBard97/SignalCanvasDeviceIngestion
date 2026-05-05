@@ -1,7 +1,10 @@
-YAMAHA|Rio1608-D2|yamaha-rio1608-d2
-AUDINATE|AVIO-AO2|audinate-avio-ao2
-SHURE|ULXD4|shure-ulxd4
-ALLEN_HEATH|SQ-5|allen-heath-sq5
-SENNHEISER|EW-DX-EM|sennheiser-ew-dx-em
-AUDINATE|AVIO-AI2|audinate-avio-ai2
-QSC|Core 110f|qsc-core-110f
+QSC|AD-C6T-LP|qsc-ad-c6t-lp
+Netgear|M4300-12X12F|netgear-m4300-12x12f
+Nexo|4X4|nexo-4x4
+DiGiCo|SD10|digico-sd10
+Whirlwind|Direct2|whirlwind-direct2
+MA Lighting|VPU plus MK2|ma-lighting-vpu-plus-mk2
+Soundcraft|Mini Stagebox 16i|soundcraft-mini-stagebox-16i
+Barco|UDM-W30|barco-udm-w30
+Behringer|UCA222|behringer-uca222
+Schoeps|MK5|schoeps-mk5

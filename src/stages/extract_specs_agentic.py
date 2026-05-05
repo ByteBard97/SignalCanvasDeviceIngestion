@@ -198,6 +198,40 @@ def _format_chunks(chunks: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+def _detect_protocol_hints(chunks: list[dict]) -> str:
+    """Scan chunks for network-audio protocol keywords and return a hint string.
+
+    This helps the LLM avoid defaulting to 'Dante' for every RJ45/etherCON port.
+    """
+    text = "\n".join(c.get("text", "") for c in chunks).lower()
+    protocols_found: list[str] = []
+    protocol_keywords = {
+        "Dante": ["dante"],
+        "AES50": ["aes50"],
+        "MADI": ["madi"],
+        "AVB": ["avb", "ieee 802.1"],
+        "Ultranet": ["ultranet"],
+        "Cobranet": ["cobranet"],
+        "Milan": ["milan"],
+    }
+    for protocol, keywords in protocol_keywords.items():
+        if any(kw in text for kw in keywords):
+            protocols_found.append(protocol)
+
+    if not protocols_found:
+        return (
+            "\nProtocol guidance: No explicit network-audio protocol (Dante, AES50, MADI, AVB, "
+            "Ultranet, Milan) was detected in the source chunks. If you see RJ45 or etherCON "
+            "ports used for audio, do NOT assume Dante. Use a generic attribute like 'Network' "
+            "or the specific protocol name ONLY if the document explicitly states it.\n"
+        )
+    return (
+        f"\nProtocol guidance: The document explicitly mentions these network-audio protocols: "
+        f"{', '.join(protocols_found)}. Use ONLY these protocol names for RJ45/etherCON audio "
+        f"ports. Do NOT add Dante unless it is explicitly listed above.\n"
+    )
+
+
 def _build_ports_prompt(
     manufacturer: str,
     model: str,
@@ -209,6 +243,7 @@ def _build_ports_prompt(
     disambiguation_section = ""
     if disambiguation:
         disambiguation_section = f"DEVICE DISAMBIGUATION (READ CAREFULLY):\n{disambiguation}\n\n"
+    protocol_hints = _detect_protocol_hints(chunks)
     return (
         f"You are the SignalCanvas device-extraction agent. Extract ONLY the physical "
         f"connectors and signal-flow bridges for {manufacturer} {model} from the chunks below.\n\n"
@@ -221,6 +256,11 @@ def _build_ports_prompt(
         f"BNC, LEMO, HDMI, RCA, or Euroblock connectors, you MUST specify the connector type. "
         f"Do not leave connector as null when the connector type is obvious from the port name "
         f"or surrounding context.\n\n"
+        f"Network-audio protocol rules: RJ45 and etherCON connectors are used for MANY "
+        f"different protocols (Dante, AES50, MADI, AVB, Ultranet, Milan, plain Ethernet). "
+        f"Do NOT default to 'Dante'. Only label a port with a specific protocol if the "
+        f"document explicitly mentions it. When in doubt, use a generic attribute or omit it.\n"
+        f"{protocol_hints}\n"
         f"Use null for unknown fields. Do not invent specs.\n\n"
         f"=== Chunks ===\n"
         f"{chunks_text}"

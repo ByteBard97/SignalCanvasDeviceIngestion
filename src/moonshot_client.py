@@ -20,10 +20,20 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import httpx
 from openai import AsyncOpenAI
+
+# Explicitly load .env so MOONSHOT_API_KEY is available regardless of how
+# this module is imported (direct, via runner, in background tasks, etc.)
+try:
+    from dotenv import load_dotenv
+    _repo_root = Path(__file__).resolve().parent.parent
+    load_dotenv(_repo_root / ".env", override=False)
+except Exception:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +67,13 @@ class MoonshotClient:
 
     def __init__(self, api_key: Optional[str] = None, base_url: str = MOONSHOT_BASE_URL):
         key = api_key or os.environ.get("MOONSHOT_API_KEY")
+        if not key:
+            # Fallback to pydantic-settings (loads .env automatically)
+            try:
+                from .config import settings
+                key = settings.moonshot_api_key
+            except Exception:
+                pass
         if not key:
             raise RuntimeError(
                 "MOONSHOT_API_KEY not set. Either export it in your shell, put it in "
