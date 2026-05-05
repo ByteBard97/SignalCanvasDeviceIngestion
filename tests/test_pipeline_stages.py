@@ -43,6 +43,7 @@ def sample_device_node(tmp_path):
         device_id="yamaha-r08d",
         manufacturer="YAMAHA",
         model="R08D",
+        corpus_id="yamaha-r08d",
         pdf_path=str(pdf_path),
         queue=0,  # Initial queue
     )
@@ -85,7 +86,7 @@ class TestStage34SubmitToRagscallion:
             mock_submit.assert_called_once_with(
                 pdf_path=sample_device_node.pdf_path,
                 corpus_id="yamaha-r08d",
-                source_label="YAMAHA R08D",
+                source_label="YAMAHA R08D (yamaha-r08d) [spec_sheet]",
                 on_conflict="error",
             )
 
@@ -125,7 +126,7 @@ class TestStage34SubmitToRagscallion:
             assert updated_node.queue == QUEUE_4_MANUAL_REVIEW
             assert updated_node.stage_index_rag == 3  # FAILED
             assert updated_node.failure_category == "RAGDB_COLLISION"
-            assert "already in corpus" in updated_node.failure_message
+            assert "already exists in corpus" in updated_node.failure_message
 
         await ragscallion_client.close()
 
@@ -293,6 +294,7 @@ class TestStage34SubmitToRagscallion:
             device_id="custom-device-id",
             manufacturer="Test",
             model="Model",
+            corpus_id="custom-device-id",
             pdf_path=str(pdf_path),
         )
         tmp_manifest.add_node(node)
@@ -332,6 +334,7 @@ class TestStage34SubmitToRagscallion:
             device_id="test-device",
             manufacturer="TestMfg",
             model="TestModel",
+            corpus_id="test-device",
             pdf_path=str(pdf_path),
         )
         tmp_manifest.add_node(node)
@@ -355,7 +358,7 @@ class TestStage34SubmitToRagscallion:
             # Verify source_label is formatted correctly
             mock_submit.assert_called_once()
             call_kwargs = mock_submit.call_args.kwargs
-            assert call_kwargs["source_label"] == "TestMfg TestModel"
+            assert call_kwargs["source_label"] == "TestMfg TestModel (test-device) [spec_sheet]"
 
         await ragscallion_client.close()
 

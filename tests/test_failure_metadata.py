@@ -206,7 +206,7 @@ class TestStage34RagscallionMetadata:
             assert retrieved.failure_stage == 3  # STAGE_INDEX_RAG
             assert retrieved.failure_category == FailureCategory.RAGDB_COLLISION.value
             assert retrieved.failure_retryable is False
-            assert "already in corpus" in retrieved.failure_message
+            assert "already exists" in retrieved.failure_message
             assert retrieved.queue == QUEUE_4_MANUAL_REVIEW
 
         await ragscallion_client.close()
