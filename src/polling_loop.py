@@ -53,11 +53,16 @@ async def run_polling_loop(
     if logger_instance:
         logger = logger_instance
 
-    # Capture initial timestamp before first poll
-    last_check = datetime.now(timezone.utc)
+    # Capture initial timestamp before first poll. If queue_2 has nodes
+    # waiting on jobs submitted earlier, rewind `since` to the earliest
+    # submission so the first poll catches anything that completed during
+    # any pipeline-down gap. Without this, jobs that finished while we were
+    # offline are silently lost — the node sits in queue_2 forever unless
+    # someone re-submits.
+    last_check = _initial_since(manifest)
     consecutive_failures = 0
 
-    logger.info("Starting Ragscallion polling loop")
+    logger.info(f"Starting Ragscallion polling loop (initial since={last_check.isoformat()})")
 
     while True:
         try:
@@ -135,6 +140,31 @@ async def run_polling_loop(
 
         # Sleep between polls
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+def _initial_since(manifest: Manifest) -> datetime:
+    """Earliest submitted_at among queue_2 nodes, or now() if queue_2 is empty.
+
+    The polling endpoint filters jobs by `since` — events older than that are
+    not returned. If a job completed during a pipeline-down gap, the next run
+    must rewind `since` past the submission time to catch it.
+    """
+    queue_2 = manifest.list_by_queue(QUEUE_2_POLLING_RAGSCALLION)
+    submissions: list[datetime] = []
+    for node in queue_2:
+        ts_str = getattr(node, "ragscallion_submitted_at", None)
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            submissions.append(ts)
+        except (ValueError, AttributeError):
+            continue
+    if not submissions:
+        return datetime.now(timezone.utc)
+    return min(submissions)
 
 
 def _process_job_result(job: dict, node, manifest: Manifest) -> None:

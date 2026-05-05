@@ -11,6 +11,7 @@ from src.polling_loop import (
     run_polling_loop,
     _check_stale_nodes,
     _process_job_result,
+    _initial_since,
     POLL_INTERVAL_SECONDS,
     CONSECUTIVE_FAILURE_WARN_THRESHOLD,
     CONSECUTIVE_FAILURE_ERROR_THRESHOLD,
@@ -733,3 +734,57 @@ class TestProcessJobResult:
         assert updated.failure_category is None
         manual_after = test_manifest.list_documents("yamaha-r08d", DOC_TYPE_USER_MANUAL)[0]
         assert manual_after.indexed_at is None  # not stamped on failure
+
+
+class TestInitialSince:
+    """Initial `since` must rewind past queue_2 submissions so jobs that
+    completed during a pipeline-down gap are caught on next startup."""
+
+    def test_no_queue_2_returns_now(self, test_manifest):
+        result = _initial_since(test_manifest)
+        # Within ~5s of now()
+        assert (datetime.now(timezone.utc) - result).total_seconds() < 5
+
+    def test_rewinds_to_earliest_queue_2_submission(self, test_manifest):
+        # Two queue_2 nodes with different submission times
+        old_ts = "2026-05-04T12:00:00+00:00"
+        new_ts = "2026-05-05T03:00:00+00:00"
+        old_node = DeviceNode(
+            device_id="old-device", manufacturer="X", model="Y",
+            queue=QUEUE_2_POLLING_RAGSCALLION,
+            ragscallion_submitted_at=old_ts,
+        )
+        new_node = DeviceNode(
+            device_id="new-device", manufacturer="X", model="Y",
+            queue=QUEUE_2_POLLING_RAGSCALLION,
+            ragscallion_submitted_at=new_ts,
+        )
+        test_manifest.add_node(old_node)
+        test_manifest.add_node(new_node)
+
+        result = _initial_since(test_manifest)
+        assert result == datetime.fromisoformat(old_ts)
+
+    def test_z_suffix_timestamp_is_parsed(self, test_manifest):
+        # Some Ragscallion responses use 'Z' suffix instead of '+00:00'
+        node = DeviceNode(
+            device_id="z-device", manufacturer="X", model="Y",
+            queue=QUEUE_2_POLLING_RAGSCALLION,
+            ragscallion_submitted_at="2026-05-04T12:00:00Z",
+        )
+        test_manifest.add_node(node)
+
+        result = _initial_since(test_manifest)
+        assert result == datetime(2026, 5, 4, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_unparseable_timestamps_are_ignored_falls_back_to_now(self, test_manifest):
+        node = DeviceNode(
+            device_id="bad-device", manufacturer="X", model="Y",
+            queue=QUEUE_2_POLLING_RAGSCALLION,
+            ragscallion_submitted_at="not-a-timestamp",
+        )
+        test_manifest.add_node(node)
+
+        result = _initial_since(test_manifest)
+        # No usable timestamps → falls back to now
+        assert (datetime.now(timezone.utc) - result).total_seconds() < 5
