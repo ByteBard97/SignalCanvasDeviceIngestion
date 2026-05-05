@@ -5,7 +5,11 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from .harness.manifest import Manifest, QUEUE_2_POLLING_RAGSCALLION
+from .harness.manifest import (
+    Manifest,
+    QUEUE_2_POLLING_RAGSCALLION,
+    DOC_TYPE_SPEC_SHEET,
+)
 from .ragscallion_client import RagscallionClient
 
 # Constants (no magic numbers per ClaudeCodeRules)
@@ -101,49 +105,7 @@ async def run_polling_loop(
                     logger.warning(f"Node not found for corpus_id={corpus_id}")
                     continue
 
-                status = job.get("status")
-
-                if status == "ready":
-                    # Move node from queue_2 (polling) to queue_3 (completed)
-                    node.queue = 3
-                    node.ragscallion_completed_at = job.get("completed_at")
-                    node.stage_convert_marker = 2  # COMPLETED
-                    node.stage_index_rag = 2  # COMPLETED
-                    manifest.persist(node)
-
-                    chunks_indexed = job.get("chunks_indexed", "?")
-                    logger.info(
-                        f"Job {job.get('job_id')} ready (corpus_id={corpus_id}): "
-                        f"{chunks_indexed} chunks indexed"
-                    )
-                    # Warn if the corpus looks too thin — may be a marketing
-                    # brochure rather than a technical manual.
-                    try:
-                        if isinstance(chunks_indexed, int) and chunks_indexed < 10:
-                            logger.warning(
-                                f"Device {corpus_id}: only {chunks_indexed} chunks "
-                                f"indexed — likely a marketing brochure, not a "
-                                f"technical manual. Consider re-searching."
-                            )
-                    except Exception:
-                        pass
-
-                elif status == "failed":
-                    # Move node from queue_2 to queue_4 (failed)
-                    error_msg = job.get("error", "Unknown error")
-                    node.queue = 4
-                    manifest.persist(node)  # Persist queue change first
-                    manifest.add_failure(
-                        device_id=corpus_id,
-                        failure_category="RAGDB_INDEXING_FAILED",
-                        failure_message=error_msg,
-                        stage=3,  # STAGE_INDEX_RAG
-                        retryable=False,
-                    )
-
-                    logger.error(
-                        f"Job {job.get('job_id')} failed (corpus_id={corpus_id}): {error_msg}"
-                    )
+                _process_job_result(job, node, manifest)
 
             # Check for stale nodes (> 15 min in queue_2 without status update)
             await _check_stale_nodes(manifest)
@@ -173,6 +135,82 @@ async def run_polling_loop(
 
         # Sleep between polls
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+def _process_job_result(job: dict, node, manifest: Manifest) -> None:
+    """Apply one ready/failed Ragscallion job to its document and (if spec_sheet)
+    advance the node.
+
+    Multi-doc semantics: every job result updates the matching device_documents
+    row. Only the spec_sheet job advances the node's queue. Secondary docs
+    continue indexing without gating extraction.
+    """
+    corpus_id = job.get("corpus_id")
+    job_id = job.get("job_id")
+    status = job.get("status")
+
+    docs = manifest.list_documents(node.device_id)
+    matching_doc = next(
+        (d for d in docs if d.ragscallion_job_id == job_id), None
+    )
+    doc_type = matching_doc.doc_type if matching_doc else None
+    is_spec_sheet = (
+        doc_type == DOC_TYPE_SPEC_SHEET
+        or (matching_doc is None and job_id == node.ragscallion_job_id)
+    )
+
+    if status == "ready":
+        if matching_doc:
+            manifest.mark_document_indexed(
+                matching_doc.id, ragscallion_job_id=job_id
+            )
+
+        chunks_indexed = job.get("chunks_indexed", "?")
+        logger.info(
+            f"Job {job_id} ready "
+            f"(corpus_id={corpus_id}, doc_type={doc_type or 'unknown'}): "
+            f"{chunks_indexed} chunks indexed"
+        )
+        try:
+            if isinstance(chunks_indexed, int) and chunks_indexed < 10:
+                logger.warning(
+                    f"Device {corpus_id} ({doc_type or 'unknown'}): "
+                    f"only {chunks_indexed} chunks indexed — likely a "
+                    f"marketing brochure, not a technical manual."
+                )
+        except Exception:
+            pass
+
+        if is_spec_sheet and node.queue == QUEUE_2_POLLING_RAGSCALLION:
+            node.queue = 3
+            node.ragscallion_completed_at = job.get("completed_at")
+            node.stage_convert_marker = 2  # COMPLETED
+            node.stage_index_rag = 2  # COMPLETED
+            manifest.persist(node)
+
+    elif status == "failed":
+        error_msg = job.get("error", "Unknown error")
+        if is_spec_sheet:
+            node.queue = 4
+            manifest.persist(node)
+            manifest.add_failure(
+                device_id=corpus_id,
+                failure_category="RAGDB_INDEXING_FAILED",
+                failure_message=error_msg,
+                stage=3,  # STAGE_INDEX_RAG
+                retryable=False,
+            )
+            logger.error(
+                f"Job {job_id} (spec_sheet) failed "
+                f"(corpus_id={corpus_id}): {error_msg}"
+            )
+        else:
+            # Secondary doc failure: log and leave indexed_at NULL. Device is
+            # not failed; spec_sheet status is what gates extraction.
+            logger.warning(
+                f"Job {job_id} ({doc_type or 'unknown'}) failed "
+                f"(corpus_id={corpus_id}): {error_msg}"
+            )
 
 
 async def _check_stale_nodes(manifest: Manifest) -> None:

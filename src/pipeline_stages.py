@@ -1083,42 +1083,37 @@ async def stage_3_4_submit_to_ragscallion(
     ragscallion_client: RagscallionClient,
     manifest: Manifest,
 ) -> bool:
-    """Submit PDF to Ragscallion for indexing. Retry up to 3 times on transient failures.
+    """Submit spec_sheet (required) plus best-effort secondary docs to Ragscallion.
 
-    Input:
-        node: Device node with pdf_path from stage 2
-        ragscallion_client: RagscallionClient instance (handles retries)
-        manifest: Manifest instance for persistence
+    Spec_sheet failure → device fails (existing semantics: queue_4 + retryable
+    metadata). Secondary submission failures → log warning, continue; the
+    device still advances on spec_sheet success.
 
     Output:
-        True if successfully submitted to queue_2 (polling)
-        False if moved to queue_4 (manual review) due to collision or failure
-
-    Processing:
-        - Submit PDF with corpus_id (device_id) and source_label (manufacturer model)
-        - Success: store job metadata, move to queue_2 for polling
-        - Collision (409): move to queue_4 with RAGDB_COLLISION category
-        - Transient failures: RagscallionClient retries with backoff
-        - After 3 failures: move to queue_4 for manual review
-
-    Side Effects:
-        - Updates node: ragscallion_job_id, corpus_id, ragscallion_submitted_at, stage markers, queue
-        - Persists node to manifest
-        - Logs submission result
+        True if spec_sheet successfully submitted (queue_2 polling).
+        False if spec_sheet failed (queue_4 manual review).
     """
     corpus_id = node.corpus_id  # Use sanitized corpus_id (may differ from device_id)
-    source_label = f"{node.manufacturer} {node.model} ({node.device_id})"
+
+    # Locate the spec_sheet document row. If missing, fall back to node.pdf_path
+    # for back-compat with rows created before device_documents existed.
+    spec_docs = manifest.list_documents(node.device_id, DOC_TYPE_SPEC_SHEET)
+    spec_doc = next((d for d in spec_docs if d.local_path), None)
+    spec_local_path = spec_doc.local_path if spec_doc else node.pdf_path
+    spec_label = f"{node.manufacturer} {node.model} ({node.device_id}) [spec_sheet]"
 
     try:
         # Submit PDF to Ragscallion with retry logic handled by client
         job = await ragscallion_client.submit_ingest(
-            pdf_path=node.pdf_path,
+            pdf_path=spec_local_path,
             corpus_id=corpus_id,
-            source_label=source_label,
+            source_label=spec_label,
             on_conflict="error",  # Reject accidental re-submissions
         )
 
-        # Success: store job metadata
+        # Success: store job metadata.
+        # TODO: remove node.ragscallion_job_id once polling_loop reads
+        # device_documents exclusively.
         node.ragscallion_job_id = job["job_id"]
         node.corpus_id = corpus_id
         node.ragscallion_submitted_at = datetime.now(timezone.utc).isoformat()
@@ -1126,10 +1121,14 @@ async def stage_3_4_submit_to_ragscallion(
         node.stage_index_rag = STAGE_IN_PROGRESS
         node.queue = QUEUE_2_POLLING_RAGSCALLION
 
+        if spec_doc:
+            manifest.set_document_job_id(spec_doc.id, job["job_id"])
         manifest.persist(node)
         logger.info(
-            f"Device {node.device_id} submitted to Ragscallion, job_id={job['job_id']}"
+            f"Device {node.device_id} spec_sheet submitted to Ragscallion, job_id={job['job_id']}"
         )
+
+        await _submit_secondary_docs(node, ragscallion_client, manifest, corpus_id)
         return True
 
     except RagscallionCollisionError as e:
@@ -1139,9 +1138,9 @@ async def stage_3_4_submit_to_ragscallion(
         )
         try:
             job = await ragscallion_client.submit_ingest(
-                pdf_path=node.pdf_path,
+                pdf_path=spec_local_path,
                 corpus_id=corpus_id,
-                source_label=source_label,
+                source_label=spec_label,
                 on_conflict="replace",
             )
             node.ragscallion_job_id = job["job_id"]
@@ -1150,10 +1149,13 @@ async def stage_3_4_submit_to_ragscallion(
             node.stage_convert_marker = STAGE_IN_PROGRESS
             node.stage_index_rag = STAGE_IN_PROGRESS
             node.queue = QUEUE_2_POLLING_RAGSCALLION
+            if spec_doc:
+                manifest.set_document_job_id(spec_doc.id, job["job_id"])
             manifest.persist(node)
             logger.info(
-                f"Device {node.device_id} re-submitted to Ragscallion (replace), job_id={job['job_id']}"
+                f"Device {node.device_id} spec_sheet re-submitted to Ragscallion (replace), job_id={job['job_id']}"
             )
+            await _submit_secondary_docs(node, ragscallion_client, manifest, corpus_id)
             return True
         except Exception as retry_e:
             node.failure_stage = STAGE_INDEX_RAG
@@ -1195,6 +1197,59 @@ async def stage_3_4_submit_to_ragscallion(
         manifest.persist(node)
         logger.error(f"Device {node.device_id} submission error: {e}")
         return False
+
+
+async def _submit_secondary_docs(
+    node: DeviceNode,
+    ragscallion_client: RagscallionClient,
+    manifest: Manifest,
+    corpus_id: str,
+) -> None:
+    """Best-effort submit each non-spec-sheet downloaded doc to Ragscallion.
+
+    Each doc is its own Ragscallion job under the same corpus_id. Failures
+    log a warning and continue — the device's queue/stage state is not changed
+    here (already advanced by the spec_sheet success path).
+    """
+    docs = manifest.list_documents(node.device_id)
+    for doc in docs:
+        if doc.doc_type == DOC_TYPE_SPEC_SHEET:
+            continue
+        if not doc.local_path or doc.ragscallion_job_id:
+            continue
+
+        label = f"{node.manufacturer} {node.model} ({node.device_id}) [{doc.doc_type}]"
+        try:
+            job = await ragscallion_client.submit_ingest(
+                pdf_path=doc.local_path,
+                corpus_id=corpus_id,
+                source_label=label,
+                on_conflict="error",
+            )
+        except RagscallionCollisionError:
+            try:
+                job = await ragscallion_client.submit_ingest(
+                    pdf_path=doc.local_path,
+                    corpus_id=corpus_id,
+                    source_label=label,
+                    on_conflict="replace",
+                )
+            except Exception as retry_e:
+                logger.warning(
+                    f"Device {node.device_id}: {doc.doc_type} replace-submit failed: {retry_e}"
+                )
+                continue
+        except Exception as e:
+            logger.warning(
+                f"Device {node.device_id}: {doc.doc_type} submit failed: {e}"
+            )
+            continue
+
+        manifest.set_document_job_id(doc.id, job["job_id"])
+        logger.info(
+            f"Device {node.device_id}: {doc.doc_type} submitted to Ragscallion, "
+            f"job_id={job['job_id']}"
+        )
 
 
 async def stage_5_extract_specs(

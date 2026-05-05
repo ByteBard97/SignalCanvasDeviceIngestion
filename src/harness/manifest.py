@@ -766,6 +766,19 @@ class Manifest:
                 )
             conn.commit()
 
+    def set_document_job_id(self, doc_id: int, ragscallion_job_id: str) -> None:
+        """Record a Ragscallion job_id for a document without marking it indexed.
+
+        Use at submission time. Indexing completion is recorded separately via
+        mark_document_indexed once the polling loop sees the job become ready.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE device_documents SET ragscallion_job_id = ? WHERE id = ?",
+                (ragscallion_job_id, doc_id),
+            )
+            conn.commit()
+
     def set_document_local_path(
         self,
         device_id: str,

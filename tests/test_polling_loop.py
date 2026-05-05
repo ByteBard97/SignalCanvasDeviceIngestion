@@ -10,12 +10,19 @@ import pytest
 from src.polling_loop import (
     run_polling_loop,
     _check_stale_nodes,
+    _process_job_result,
     POLL_INTERVAL_SECONDS,
     CONSECUTIVE_FAILURE_WARN_THRESHOLD,
     CONSECUTIVE_FAILURE_ERROR_THRESHOLD,
     STALE_NODE_WARNING_MINUTES,
 )
-from src.harness.manifest import Manifest, DeviceNode, QUEUE_2_POLLING_RAGSCALLION
+from src.harness.manifest import (
+    Manifest,
+    DeviceNode,
+    QUEUE_2_POLLING_RAGSCALLION,
+    DOC_TYPE_SPEC_SHEET,
+    DOC_TYPE_USER_MANUAL,
+)
 from src.ragscallion_client import RagscallionClient
 
 
@@ -650,3 +657,79 @@ class TestPollingLoopEdgeCases:
         # Node should remain unchanged
         updated_node = test_manifest.get_node("yamaha-r08d")
         assert updated_node.queue == QUEUE_2_POLLING_RAGSCALLION
+
+
+class TestProcessJobResult:
+    """Phase C — per-job processing must distinguish spec_sheet from secondaries."""
+
+    def _setup(self, test_manifest):
+        node = DeviceNode(
+            device_id="yamaha-r08d",
+            manufacturer="Yamaha",
+            model="R08D",
+            corpus_id="yamaha-r08d",
+            queue=QUEUE_2_POLLING_RAGSCALLION,
+            ragscallion_job_id="spec-job",
+        )
+        test_manifest.add_node(node)
+        spec_doc = test_manifest.add_document(
+            "yamaha-r08d", DOC_TYPE_SPEC_SHEET,
+            url="https://example.com/spec.pdf", local_path="/tmp/spec.pdf",
+        )
+        manual_doc = test_manifest.add_document(
+            "yamaha-r08d", DOC_TYPE_USER_MANUAL,
+            url="https://example.com/manual.pdf", local_path="/tmp/manual.pdf",
+        )
+        test_manifest.set_document_job_id(spec_doc.id, "spec-job")
+        test_manifest.set_document_job_id(manual_doc.id, "manual-job")
+        return node, spec_doc, manual_doc
+
+    def test_spec_sheet_ready_advances_node_and_marks_indexed(self, test_manifest):
+        node, spec_doc, manual_doc = self._setup(test_manifest)
+        job = {
+            "job_id": "spec-job", "corpus_id": "yamaha-r08d",
+            "status": "ready", "chunks_indexed": 42,
+            "completed_at": "2026-04-29T11:00:00Z",
+        }
+
+        _process_job_result(job, node, test_manifest)
+
+        updated = test_manifest.get_node("yamaha-r08d")
+        assert updated.queue == 3  # advanced to QUEUE_3_READY_FOR_EXTRACTION
+        assert updated.stage_index_rag == 2  # COMPLETED
+        spec_after = test_manifest.list_documents("yamaha-r08d", DOC_TYPE_SPEC_SHEET)[0]
+        assert spec_after.indexed_at is not None
+        manual_after = test_manifest.list_documents("yamaha-r08d", DOC_TYPE_USER_MANUAL)[0]
+        assert manual_after.indexed_at is None  # secondary untouched
+
+    def test_secondary_ready_marks_indexed_but_does_not_advance_node(self, test_manifest):
+        node, _, manual_doc = self._setup(test_manifest)
+        job = {
+            "job_id": "manual-job", "corpus_id": "yamaha-r08d",
+            "status": "ready", "chunks_indexed": 25,
+        }
+
+        _process_job_result(job, node, test_manifest)
+
+        updated = test_manifest.get_node("yamaha-r08d")
+        assert updated.queue == QUEUE_2_POLLING_RAGSCALLION  # not advanced
+        assert updated.stage_index_rag == 0  # unchanged
+        manual_after = test_manifest.list_documents("yamaha-r08d", DOC_TYPE_USER_MANUAL)[0]
+        assert manual_after.indexed_at is not None
+        spec_after = test_manifest.list_documents("yamaha-r08d", DOC_TYPE_SPEC_SHEET)[0]
+        assert spec_after.indexed_at is None  # spec untouched
+
+    def test_secondary_failure_does_not_fail_node(self, test_manifest):
+        node, _, manual_doc = self._setup(test_manifest)
+        job = {
+            "job_id": "manual-job", "corpus_id": "yamaha-r08d",
+            "status": "failed", "error": "indexing exploded",
+        }
+
+        _process_job_result(job, node, test_manifest)
+
+        updated = test_manifest.get_node("yamaha-r08d")
+        assert updated.queue == QUEUE_2_POLLING_RAGSCALLION  # not failed
+        assert updated.failure_category is None
+        manual_after = test_manifest.list_documents("yamaha-r08d", DOC_TYPE_USER_MANUAL)[0]
+        assert manual_after.indexed_at is None  # not stamped on failure

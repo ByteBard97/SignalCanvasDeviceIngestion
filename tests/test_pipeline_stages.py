@@ -7,7 +7,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.harness.manifest import DeviceNode, Manifest, QUEUE_2_POLLING_RAGSCALLION, QUEUE_4_MANUAL_REVIEW
+from src.harness.manifest import (
+    DeviceNode,
+    Manifest,
+    QUEUE_2_POLLING_RAGSCALLION,
+    QUEUE_4_MANUAL_REVIEW,
+    DOC_TYPE_SPEC_SHEET,
+    DOC_TYPE_USER_MANUAL,
+    DOC_TYPE_INSTALL_GUIDE,
+)
 from src.pipeline_stages import stage_3_4_submit_to_ragscallion
 from src.ragscallion_client import (
     RagscallionClient,
@@ -376,5 +384,113 @@ class TestStage34SubmitToRagscallion:
             mock_submit.assert_called_once()
             call_kwargs = mock_submit.call_args.kwargs
             assert call_kwargs["on_conflict"] == "error"
+
+        await ragscallion_client.close()
+
+
+class TestStage34MultiDocSubmission:
+    """Tests for Phase C — secondary doc submission alongside spec_sheet."""
+
+    @pytest.mark.asyncio
+    async def test_secondaries_submitted_after_spec_sheet(
+        self, sample_device_node, tmp_manifest, ragscallion_client, tmp_path
+    ):
+        """Spec_sheet + user_manual + install_guide each get submit_ingest calls
+        and per-doc job_ids are recorded in device_documents."""
+        sample_device_node.corpus_id = "yamaha-r08d"
+        tmp_manifest.add_node(sample_device_node)
+
+        # Seed the spec_sheet doc row to mirror Stage 1/2 behavior.
+        tmp_manifest.add_document(
+            sample_device_node.device_id,
+            DOC_TYPE_SPEC_SHEET,
+            url="https://example.com/r08d-datasheet.pdf",
+            local_path=sample_device_node.pdf_path,
+        )
+        manual_path = tmp_path / "manual.pdf"
+        manual_path.write_bytes(b"%PDF-manual")
+        install_path = tmp_path / "install.pdf"
+        install_path.write_bytes(b"%PDF-install")
+        tmp_manifest.add_document(
+            sample_device_node.device_id,
+            DOC_TYPE_USER_MANUAL,
+            url="https://example.com/r08d-manual.pdf",
+            local_path=str(manual_path),
+        )
+        tmp_manifest.add_document(
+            sample_device_node.device_id,
+            DOC_TYPE_INSTALL_GUIDE,
+            url="https://example.com/r08d-install.pdf",
+            local_path=str(install_path),
+        )
+
+        with patch.object(
+            ragscallion_client, "submit_ingest", new_callable=AsyncMock
+        ) as mock_submit:
+            mock_submit.side_effect = [
+                {"job_id": "spec-job", "corpus_id": "yamaha-r08d", "status": "queued"},
+                {"job_id": "manual-job", "corpus_id": "yamaha-r08d", "status": "queued"},
+                {"job_id": "install-job", "corpus_id": "yamaha-r08d", "status": "queued"},
+            ]
+
+            result = await stage_3_4_submit_to_ragscallion(
+                sample_device_node, ragscallion_client, tmp_manifest
+            )
+
+            assert result is True
+            assert mock_submit.await_count == 3
+
+            docs = tmp_manifest.list_documents(sample_device_node.device_id)
+            by_type = {d.doc_type: d for d in docs}
+            assert by_type[DOC_TYPE_SPEC_SHEET].ragscallion_job_id == "spec-job"
+            assert by_type[DOC_TYPE_USER_MANUAL].ragscallion_job_id == "manual-job"
+            assert by_type[DOC_TYPE_INSTALL_GUIDE].ragscallion_job_id == "install-job"
+            for doc in docs:
+                assert doc.indexed_at is None  # not indexed until polling sees ready
+
+        await ragscallion_client.close()
+
+    @pytest.mark.asyncio
+    async def test_secondary_failure_does_not_fail_device(
+        self, sample_device_node, tmp_manifest, ragscallion_client, tmp_path
+    ):
+        """Secondary submit raising → device still advances on spec_sheet success."""
+        sample_device_node.corpus_id = "yamaha-r08d"
+        tmp_manifest.add_node(sample_device_node)
+        tmp_manifest.add_document(
+            sample_device_node.device_id,
+            DOC_TYPE_SPEC_SHEET,
+            url="https://example.com/r08d-datasheet.pdf",
+            local_path=sample_device_node.pdf_path,
+        )
+        manual_path = tmp_path / "manual.pdf"
+        manual_path.write_bytes(b"%PDF-manual")
+        tmp_manifest.add_document(
+            sample_device_node.device_id,
+            DOC_TYPE_USER_MANUAL,
+            url="https://example.com/r08d-manual.pdf",
+            local_path=str(manual_path),
+        )
+
+        with patch.object(
+            ragscallion_client, "submit_ingest", new_callable=AsyncMock
+        ) as mock_submit:
+            mock_submit.side_effect = [
+                {"job_id": "spec-job", "corpus_id": "yamaha-r08d", "status": "queued"},
+                RagscallionError("503 service unavailable"),
+            ]
+
+            result = await stage_3_4_submit_to_ragscallion(
+                sample_device_node, ragscallion_client, tmp_manifest
+            )
+
+            assert result is True  # spec_sheet succeeded → device advances
+            updated = tmp_manifest.get_node(sample_device_node.device_id)
+            assert updated.queue == QUEUE_2_POLLING_RAGSCALLION
+
+            docs = tmp_manifest.list_documents(sample_device_node.device_id)
+            by_type = {d.doc_type: d for d in docs}
+            assert by_type[DOC_TYPE_SPEC_SHEET].ragscallion_job_id == "spec-job"
+            assert by_type[DOC_TYPE_USER_MANUAL].ragscallion_job_id is None
 
         await ragscallion_client.close()

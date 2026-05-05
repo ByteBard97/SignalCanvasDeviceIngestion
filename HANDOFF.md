@@ -43,11 +43,14 @@ Manifest's `failure_category` column is NULL for all 36 devices — historical f
 ### Phase B — DONE
 `stage_1_find_pdf` now refactored: spec_sheet path runs in `_find_spec_sheet_url` (holds FIND_PDF_SEMAPHORE); after that returns success, `_gather_secondary_docs` runs user_manual + install_guide searches in parallel via `_find_secondary_doc` (each acquires the same semaphore independently — no nesting/deadlock). Each is single-attempt, best-effort: failures log a warning and continue. Stage 2 follows the spec_sheet download with `_download_secondary_docs` which iterates `manifest.list_documents` and downloads each non-spec-sheet to `cache_dir / "<device_id>__<doc_type>.pdf"`. New tests in `tests/test_stage_1_find_pdf.py::TestSecondaryDocSearch` cover happy path, URL mismatch rejection, and exception swallowing. Cost knob: `config.find_secondary_docs` (default True).
 
-### Phase C — Stage 3 multi-doc ragscallion submission (ready to start)
-Currently `stage_3_4_submit_to_ragscallion` submits `node.pdf_path` and stores `node.ragscallion_job_id`. Change:
-- Iterate `list_documents(device_id)` where `local_path IS NOT NULL`. For each, call `submit_ingest` and store the per-doc job_id. **Need new helper:** `set_document_job_id(doc_id, job_id)` that does NOT touch indexed_at — split submission from index-completion (current `mark_document_indexed` conflates them).
-- Polling loop (`src/polling_loop.py`): for each device in QUEUE_2, iterate its docs and poll any with `ragscallion_job_id IS NOT NULL AND indexed_at IS NULL`. When the spec_sheet finishes indexing, mark `stage_index_rag COMPLETED` and advance the queue. Secondary docs continue polling in background.
-- `device_nodes.ragscallion_job_id` stays as spec_sheet job — add `# TODO: remove once polling_loop reads device_documents exclusively`.
+### Phase C — DONE (logic), needs real-device shakedown
+`stage_3_4_submit_to_ragscallion` now submits the spec_sheet (existing collision/unavailable semantics intact) and then calls `_submit_secondary_docs` to best-effort submit each non-spec_sheet doc with `local_path` set; per-doc job_ids are recorded via new `manifest.set_document_job_id(doc_id, job_id)`. `device_nodes.ragscallion_job_id` is preserved as the spec_sheet job for back-compat, marked with a `TODO: remove` once the polling loop reads device_documents exclusively.
+
+Polling loop refactored: per-job processing extracted into `_process_job_result(job, node, manifest)`. For each ready/failed job: matched to the device_documents row by `job_id`, indexed_at stamped on success, failures on secondaries logged but don't fail the node. Only the spec_sheet ready event advances the node from queue_2 → queue_3 (gated by `node.queue == QUEUE_2_POLLING_RAGSCALLION` to make re-deliveries idempotent).
+
+New tests: `tests/test_pipeline_stages.py::TestStage34MultiDocSubmission` (multi-doc submit + secondary failure tolerance), `tests/test_polling_loop.py::TestProcessJobResult` (spec_sheet ready advances node, secondary ready doesn't, secondary failure doesn't fail node).
+
+**Validation gap:** Phase B and Phase C are shipped on logic + unit tests only. Before declaring extraction-ready, run one real device end-to-end and confirm: `device_documents` has 1–3 rows with `local_path` and `ragscallion_job_id` set; node advances to queue_3 as soon as spec_sheet `indexed_at` is stamped (does not wait for secondaries); secondary docs' `indexed_at` populates as their jobs finish.
 
 ## Key files
 - `src/harness/manifest.py` — schema + CRUD
@@ -69,7 +72,7 @@ Currently `stage_3_4_submit_to_ragscallion` submits `node.pdf_path` and stores `
 - **Ragscallion:** server runs at `192.168.0.200:8086` on a Linux box (Geoff has SSH as `your-username@localhost`). Vector store. Schema-flexible — already accepts arbitrary `submit_ingest` calls; multi-doc per device key works server-side without changes.
 
 ## Tasks (state at handoff)
-1-2 completed (Stage 1/2 wiring), 3 deleted (superseded by 6), 4 completed-with-note (Phase A abandoned), 5 completed (Phase B), 7-10 completed (D+E plus reviewer fixes). 6 (Phase C) is ready to start.
+1-2 completed (Stage 1/2 wiring), 3 deleted (superseded by 6), 4 completed-with-note (Phase A abandoned), 5 completed (Phase B), 6 completed-pending-validation (Phase C — needs one real-device shakedown), 7-10 completed (D+E plus reviewer fixes).
 
 ## Last advisor feedback worth keeping
 - For Phase C, partial-failure semantics: spec_sheet must succeed for stage_index_rag = COMPLETED; secondaries are best-effort (mirrors Phase B).
