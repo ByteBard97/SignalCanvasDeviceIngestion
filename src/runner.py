@@ -30,6 +30,7 @@ from .harness.manifest import (
     QUEUE_2_POLLING_RAGSCALLION,
     QUEUE_3_READY_FOR_EXTRACTION,
     QUEUE_4_MANUAL_REVIEW,
+    QUEUE_5_COMPLETED,
     STAGE_FIND_PDF,
     STAGE_DOWNLOAD_PDF,
     STAGE_CONVERT_MARKER,
@@ -304,6 +305,38 @@ def _create_nodes(
     return nodes
 
 
+def _summarize_device_status(nodes: list[DeviceNode]) -> None:
+    """Log how many input devices are new, in-progress, completed, or failed."""
+    counts: dict[int, list[str]] = {
+        QUEUE_0_INITIAL: [],
+        QUEUE_1_CANNOT_FIND_PDF: [],
+        QUEUE_2_POLLING_RAGSCALLION: [],
+        QUEUE_3_READY_FOR_EXTRACTION: [],
+        QUEUE_4_MANUAL_REVIEW: [],
+        QUEUE_5_COMPLETED: [],
+    }
+    for node in nodes:
+        counts.setdefault(node.queue, []).append(node.device_id)
+
+    new = len(counts[QUEUE_0_INITIAL])
+    stuck = len(counts[QUEUE_1_CANNOT_FIND_PDF])
+    polling = len(counts[QUEUE_2_POLLING_RAGSCALLION])
+    ready = len(counts[QUEUE_3_READY_FOR_EXTRACTION])
+    failed = len(counts[QUEUE_4_MANUAL_REVIEW])
+    completed = len(counts[QUEUE_5_COMPLETED])
+
+    total = len(nodes)
+    logger.info(
+        f"Device status summary ({total} total): "
+        f"{new} new, {stuck} stuck, {polling} polling, {ready} ready, "
+        f"{failed} failed, {completed} completed"
+    )
+    if completed:
+        logger.info(f"  Already completed (will skip): {', '.join(counts[QUEUE_5_COMPLETED])}")
+    if failed:
+        logger.info(f"  Previously failed (will retry if retryable): {', '.join(counts[QUEUE_4_MANUAL_REVIEW])}")
+
+
 def _is_pipeline_done(manifest: Manifest) -> bool:
     """Return True if no nodes remain in queues 0, 1, 2, or 3."""
     for q in (QUEUE_0_INITIAL, QUEUE_1_CANNOT_FIND_PDF, QUEUE_2_POLLING_RAGSCALLION, QUEUE_3_READY_FOR_EXTRACTION):
@@ -353,6 +386,8 @@ async def run_pipeline(
     if not nodes:
         logger.warning("No devices to process")
         return
+
+    _summarize_device_status(nodes)
 
     logger.info(f"Starting pipeline for {len(nodes)} devices")
 

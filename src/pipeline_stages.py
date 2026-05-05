@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import re
+import ssl
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,81 +65,23 @@ RESOLVE_SKU_MAX_STEPS = 8  # more breadth than Stage 1 — alias may map to seve
 RESOLVE_SKU_SEMAPHORE = asyncio.Semaphore(3)
 DOWNLOAD_TIMEOUT_SECONDS = 60
 DOWNLOAD_FALLBACK_ATTEMPTS = 1  # if first URL fails (e.g. bad cert), ask Kimi for one alternate
+
+
+def _is_ssl_error(exc: Exception) -> bool:
+    """Return True if *exc* is an SSL certificate verification failure."""
+    msg = str(exc).lower()
+    return (
+        "certificate verify failed" in msg
+        or "ssl" in msg
+        or isinstance(exc, ssl.SSLError)
+    )
 FALLBACK_URL_TIMEOUT_SECONDS = 90
 FALLBACK_URL_MAX_STEPS = 5
 FALLBACK_URL_KIMI_RETRIES = 2  # the kimi CLI itself occasionally exits non-zero; retry once
 
-# URL relevance heuristic constants
-_OPAQUE_SLUG_MIN_LEN = 12  # below this, treat slug as a product code, not a hash
-_OPAQUE_SLUG_HEX_RATIO = 0.7  # ratio of hex chars above which slug is "opaque"
-_MODEL_TOKEN_MIN_LEN = 2  # ignore single-character model tokens like "5" in "SQ-5"
-
-
-def _model_tokens(model: str) -> list[str]:
-    """Split a model string into significant tokens.
-
-    Splits on non-alphanumeric punctuation AND on letter/digit boundaries, so
-    'ULXD4' yields ['ULXD', '4'] (matching shure.com/view/guide/ULXD/...) and
-    'Rio1608-D2' yields ['Rio', '1608', 'D', '2'].
-    Tokens shorter than _MODEL_TOKEN_MIN_LEN are dropped.
-    """
-    import re
-    raw = re.split(r"[^A-Za-z0-9]+", model)
-    tokens: list[str] = []
-    for chunk in raw:
-        # Keep the chunk itself as a token (handles short codes like H6, X32)
-        if len(chunk) >= _MODEL_TOKEN_MIN_LEN:
-            tokens.append(chunk)
-        # Also split letter→digit and digit→letter transitions
-        for sub in re.findall(r"[A-Za-z]+|[0-9]+", chunk):
-            tokens.append(sub)
-    filtered = [t for t in tokens if len(t) >= _MODEL_TOKEN_MIN_LEN]
-    # Order-preserving dedupe — duplicate tokens add no matching power and
-    # clutter logs / test assertions.
-    result = list(dict.fromkeys(filtered))
-    # Fallback: if nothing survived, try the stripped model name as one token
-    if not result:
-        stripped = re.sub(r"[^A-Za-z0-9]", "", model)
-        if stripped:
-            result.append(stripped)
-    return result
-
-
-def _looks_opaque(slug: str) -> bool:
-    """A slug like '1078f753f2bbafa663cc873b1299a43e1fd6' carries no product hint.
-
-    Treat as opaque only when long enough to plausibly be a content hash; short
-    slugs like 'adp' are product codes, not hashes, and must be checked.
-    """
-    if len(slug) < _OPAQUE_SLUG_MIN_LEN:
-        return False
-    hex_count = sum(1 for c in slug.lower() if c in "0123456789abcdef")
-    return hex_count / len(slug) > _OPAQUE_SLUG_HEX_RATIO
-
-
-def _url_likely_matches_model(url: str, model: str) -> bool:
-    """Return False when the URL filename looks like a product code unrelated to the model.
-
-    Accepts the URL when:
-      - any model token appears in the URL path, or
-      - the filename is opaque (CDN content hash) — we can't tell from the URL.
-
-    Rejects only when the filename is name-like but contains no model token,
-    e.g. AVIO-AO2 vs '.../dataSheet/ADP.pdf'.
-    """
-    from urllib.parse import urlparse
-    path = urlparse(url).path.lower()
-    slug = path.rsplit("/", 1)[-1]
-    if slug.endswith(".pdf"):
-        slug = slug[:-4]
-    tokens = [t.lower() for t in _model_tokens(model)]
-    if not tokens:
-        return True
-    if any(t in path for t in tokens):
-        return True
-    if _looks_opaque(slug):
-        return True
-    return False
+# Minimum PDF size to accept (bytes). Anything smaller is likely a redirect
+# stub, landing page, or one-page product info sheet.
+_MIN_PDF_SIZE_BYTES = 30 * 1024  # 30 KB
 
 
 def _build_find_pdf_prompt(manufacturer: str, model: str, exclude_urls: list[str]) -> str:
@@ -253,7 +196,7 @@ async def _search_duckduckgo_for_pdf(
     """
     import httpx
 
-    query = f'{manufacturer} {model} pdf'
+    query = f'{manufacturer} {model} pdf manual datasheet'
     search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -311,11 +254,7 @@ async def _search_duckduckgo_for_pdf(
                 logger.debug(f"DDG candidate rejected (non-PDF): {url}")
                 continue
 
-        if not _url_likely_matches_model(url, model):
-            logger.debug(f"DDG candidate rejected (model mismatch): {url}")
-            continue
-
-        logger.info(f"DDG fallback found valid PDF: {url}")
+        logger.info(f"DDG fallback found PDF: {url}")
         return url
 
     return None
@@ -607,22 +546,6 @@ async def _find_spec_sheet_url(
                     rejected_urls.append(pdf_url)
                     continue
 
-            # Validate URL against both SKU and model name. Some manufacturers
-            # use internal SKUs (e.g. SWRCONVRCK2) that never appear in PDF
-            # filenames; the model name (e.g. "ATEM Studio Converter 2") is
-            # what actually shows up in URLs.
-            if not _url_likely_matches_model(
-                pdf_url, sku_for_search
-            ) and not _url_likely_matches_model(pdf_url, node.model):
-                last_failure_message = (
-                    f"URL filename does not match model {sku_for_search}: {pdf_url}"
-                )
-                logger.warning(
-                    f"Device {node.device_id} Stage 1 attempt {attempt}: rejecting wrong-device URL {pdf_url}"
-                )
-                rejected_urls.append(pdf_url)
-                continue
-
             node.pdf_url = pdf_url
             node.stage_find_pdf = STAGE_COMPLETED
             manifest.add_document(
@@ -741,12 +664,10 @@ async def _find_secondary_doc(
                 )
                 return None
 
-        if not _url_likely_matches_model(pdf_url, sku_for_search) and \
-           not _url_likely_matches_model(pdf_url, node.model):
-            logger.info(
-                f"Device {node.device_id}: {doc_type} URL filename mismatch, skipping: {pdf_url}"
-            )
-            return None
+        # Secondary docs intentionally skip the filename-mismatch check.
+        # Series-level or generic filenames (e.g. 2000ser_om.pdf) are common
+        # for user manuals and install guides, and the Kimi prompt already
+        # scopes the search to the correct manufacturer/product family.
 
         manifest.add_document(node.device_id, doc_type, url=pdf_url)
         logger.info(f"Device {node.device_id}: {doc_type} found: {pdf_url}")
@@ -772,6 +693,7 @@ async def _download_secondary_docs(
             continue
 
         local_path = cache_dir / f"{node.device_id}__{doc.doc_type}.pdf"
+        content: bytes | None = None
         try:
             async with httpx.AsyncClient(
                 follow_redirects=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
@@ -784,24 +706,54 @@ async def _download_secondary_docs(
                     },
                 )
                 resp.raise_for_status()
-            content = resp.content
-            if len(content) < 4 or content[:4] != b"%PDF":
+                content = resp.content
+        except Exception as e:
+            if _is_ssl_error(e):
                 logger.warning(
-                    f"Device {node.device_id}: {doc.doc_type} not a valid PDF, skipping"
+                    f"Device {node.device_id}: {doc.doc_type} SSL verify failed, "
+                    f"retrying with verify=False"
+                )
+                try:
+                    async with httpx.AsyncClient(
+                        follow_redirects=True,
+                        timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                        verify=False,
+                    ) as client:
+                        resp = await client.get(
+                            doc.url,
+                            headers={
+                                **_BROWSER_HEADERS,
+                                "Referer": f"https://www.google.com/search?q={urllib.parse.quote(doc.url)}",
+                            },
+                        )
+                        resp.raise_for_status()
+                        content = resp.content
+                except Exception as inner:
+                    logger.warning(
+                        f"Device {node.device_id}: {doc.doc_type} download failed: {inner}"
+                    )
+                    continue
+            else:
+                logger.warning(
+                    f"Device {node.device_id}: {doc.doc_type} download failed: {e}"
                 )
                 continue
-            local_path.write_bytes(content)
-            manifest.set_document_local_path(
-                node.device_id, doc.doc_type, doc.url, str(local_path)
-            )
-            logger.info(
-                f"Device {node.device_id}: {doc.doc_type} downloaded to {local_path} "
-                f"({len(content)} bytes)"
-            )
-        except Exception as e:
+
+        if content is None:
+            continue
+        if len(content) < 4 or content[:4] != b"%PDF":
             logger.warning(
-                f"Device {node.device_id}: {doc.doc_type} download failed: {e}"
+                f"Device {node.device_id}: {doc.doc_type} not a valid PDF, skipping"
             )
+            continue
+        local_path.write_bytes(content)
+        manifest.set_document_local_path(
+            node.device_id, doc.doc_type, doc.url, str(local_path)
+        )
+        logger.info(
+            f"Device {node.device_id}: {doc.doc_type} downloaded to {local_path} "
+            f"({len(content)} bytes)"
+        )
 
 
 # Shared browser-like headers for requests that need to look like a real user
@@ -817,13 +769,25 @@ _BROWSER_HEADERS = {
 
 async def _verify_pdf_content_type(url: str) -> bool:
     """Verify that a URL returns application/pdf via HEAD request."""
+    import httpx
     try:
-        import httpx
         async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
             resp = await client.head(url, headers=_BROWSER_HEADERS)
             content_type = resp.headers.get("content-type", "").lower()
             return "pdf" in content_type
     except Exception as e:
+        if _is_ssl_error(e):
+            logger.debug(f"HEAD request SSL failed for {url}, retrying with verify=False")
+            try:
+                async with httpx.AsyncClient(
+                    follow_redirects=True, timeout=10.0, verify=False
+                ) as client:
+                    resp = await client.head(url, headers=_BROWSER_HEADERS)
+                    content_type = resp.headers.get("content-type", "").lower()
+                    return "pdf" in content_type
+            except Exception as inner:
+                logger.debug(f"HEAD request failed for {url}: {inner}")
+                return False
         logger.debug(f"HEAD request failed for {url}: {e}")
         return False
 
@@ -876,25 +840,91 @@ async def stage_2_download_pdf(
         current_url = node.pdf_url
         last_error = "no attempts made"
 
+        async def _try_download(url: str) -> bytes:
+            """Download PDF bytes, transparently retrying with verify=False on SSL errors."""
+            import httpx
+            headers = {
+                **_BROWSER_HEADERS,
+                "Referer": f"https://www.google.com/search?q={urllib.parse.quote(url)}",
+            }
+            try:
+                async with httpx.AsyncClient(
+                    follow_redirects=True,
+                    timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                    verify=True,
+                ) as client:
+                    r = await client.get(url, headers=headers)
+                    r.raise_for_status()
+                    return r.content
+            except Exception as e:
+                if _is_ssl_error(e):
+                    logger.warning(
+                        f"Device {node.device_id} SSL verify failed for {url}, "
+                        f"retrying with verify=False"
+                    )
+                    async with httpx.AsyncClient(
+                        follow_redirects=True,
+                        timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                        verify=False,
+                    ) as client:
+                        r = await client.get(url, headers=headers)
+                        r.raise_for_status()
+                        return r.content
+                raise
+
         for attempt in range(1 + DOWNLOAD_FALLBACK_ATTEMPTS):
             tried_urls.append(current_url)
 
             try:
-                async with httpx.AsyncClient(
-                    follow_redirects=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
-                ) as client:
-                    resp = await client.get(
-                        current_url,
-                        headers={
-                            **_BROWSER_HEADERS,
-                            "Referer": f"https://www.google.com/search?q={urllib.parse.quote(current_url)}",
-                        },
-                    )
-                    resp.raise_for_status()
+                content = await _try_download(current_url)
             except httpx.HTTPStatusError as e:
-                # Server reached, returned 4xx/5xx. Don't waste a fallback on this —
-                # an HTTP error code is a definitive "no" from the server, not
-                # an infrastructure issue Kimi can route around.
+                status = e.response.status_code
+                # 403/429/503 are usually bot-protection (Cloudflare, rate limits,
+                # temporary unavailability) — not a definitive "no". Treat them
+                # like connection errors and try a fallback URL.
+                if status in (403, 429, 503):
+                    last_error = f"HTTP {status} (bot protection or temporary unavailable)"
+                    logger.warning(
+                        f"Device {node.device_id} Stage 2 attempt {attempt + 1} "
+                        f"download blocked ({last_error}); trying fallback URL"
+                        if attempt < DOWNLOAD_FALLBACK_ATTEMPTS
+                        else f"Device {node.device_id} Stage 2 attempt {attempt + 1} download blocked ({last_error})"
+                    )
+                    if attempt < DOWNLOAD_FALLBACK_ATTEMPTS:
+                        # First: ask DDG for the next candidate (cheaper & faster than Kimi).
+                        # Add the blocked URL to rejected_urls so DDG skips it.
+                        tried_urls.append(current_url)
+                        ddg_alt = await _search_duckduckgo_for_pdf(
+                            node.manufacturer, node.model, tried_urls
+                        )
+                        if ddg_alt:
+                            logger.info(
+                                f"Device {node.device_id} DDG next candidate after block: {ddg_alt}"
+                            )
+                            current_url = ddg_alt
+                            continue
+
+                        # Second: ask Kimi for a manufacturer-direct alternate.
+                        alt_url = await _request_alternate_pdf_url(
+                            manufacturer=node.manufacturer,
+                            sku=_resolved_sku(node),
+                            failed_url=current_url,
+                            error_summary=last_error,
+                            tried_urls=tried_urls,
+                        )
+                        if alt_url:
+                            current_url = alt_url
+                            continue
+                    _set_stage_failure(
+                        node,
+                        manifest,
+                        stage=STAGE_DOWNLOAD_PDF,
+                        category=FailureCategory.PDF_DOWNLOAD_FAILED,
+                        message=f"HTTP download error after {len(tried_urls)} URL(s): {last_error}",
+                        retryable=True,
+                    )
+                    return False
+                # Other 4xx/5xx (404, 410, 500, etc.) are definitive failures.
                 _set_stage_failure(
                     node,
                     manifest,
@@ -935,7 +965,6 @@ async def stage_2_download_pdf(
                 )
                 return False
 
-            content = resp.content
             if len(content) < 4 or content[:4] != b"%PDF":
                 _set_stage_failure(
                     node,
@@ -944,6 +973,34 @@ async def stage_2_download_pdf(
                     category=FailureCategory.PDF_INVALID,
                     message="Downloaded file is not a valid PDF (first 4 bytes != %PDF)",
                     retryable=False,
+                )
+                return False
+
+            if len(content) < _MIN_PDF_SIZE_BYTES:
+                logger.warning(
+                    f"Device {node.device_id} downloaded PDF is only {len(content)} bytes "
+                    f"(< {_MIN_PDF_SIZE_BYTES} threshold); treating as stub/redirect. "
+                    f"Trying fallback URL."
+                )
+                last_error = f"PDF too small ({len(content)} bytes)"
+                if attempt < DOWNLOAD_FALLBACK_ATTEMPTS:
+                    alt_url = await _request_alternate_pdf_url(
+                        manufacturer=node.manufacturer,
+                        sku=_resolved_sku(node),
+                        failed_url=current_url,
+                        error_summary=last_error,
+                        tried_urls=tried_urls,
+                    )
+                    if alt_url:
+                        current_url = alt_url
+                        continue
+                _set_stage_failure(
+                    node,
+                    manifest,
+                    stage=STAGE_DOWNLOAD_PDF,
+                    category=FailureCategory.PDF_INVALID,
+                    message=f"Downloaded PDF too small ({len(content)} bytes) after {len(tried_urls)} URL(s)",
+                    retryable=True,
                 )
                 return False
 

@@ -48,9 +48,10 @@ class TestStage2DownloadPDF:
         tmp_manifest.add_node(sample_node)
         cache_dir = tmp_path / "pdfs"
 
-        # Mock HTTP response with valid PDF content
+        # Mock HTTP response with valid PDF content (>30 KB threshold)
+        pdf_content = b"%PDF-1.4\n" + b"x" * 31_000
         route = respx.get("https://example.com/datasheet.pdf").mock(
-            return_value=httpx.Response(200, content=b"%PDF-1.4\ntest content")
+            return_value=httpx.Response(200, content=pdf_content)
         )
 
         result = await stage_2_download_pdf(sample_node, tmp_manifest, cache_dir=cache_dir)
@@ -62,7 +63,7 @@ class TestStage2DownloadPDF:
         assert updated.stage_download_pdf == STAGE_COMPLETED
         assert updated.pdf_path is not None
         assert Path(updated.pdf_path).exists()
-        assert Path(updated.pdf_path).read_bytes() == b"%PDF-1.4\ntest content"
+        assert Path(updated.pdf_path).read_bytes() == pdf_content
 
     @respx.mock
     @pytest.mark.asyncio
@@ -135,8 +136,9 @@ class TestStage2FallbackUrl:
         )
         # Fallback URL Kimi suggests
         alt_url = "https://www.audinate.com/datasheet.pdf"
+        alt_pdf_content = b"%PDF-1.7\n" + b"x" * 31_000
         respx.get(alt_url).mock(
-            return_value=httpx.Response(200, content=b"%PDF-1.7\nfallback content")
+            return_value=httpx.Response(200, content=alt_pdf_content)
         )
 
         with patch(

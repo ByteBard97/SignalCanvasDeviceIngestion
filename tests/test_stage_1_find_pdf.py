@@ -15,9 +15,6 @@ from src.pipeline_stages import STAGE_COMPLETED, STAGE_FAILED
 from src.pipeline_stages import (
     stage_1_find_pdf,
     _find_secondary_doc,
-    _url_likely_matches_model,
-    _looks_opaque,
-    _model_tokens,
 )
 from src.harness.manifest import DOC_TYPE_USER_MANUAL, DOC_TYPE_INSTALL_GUIDE
 
@@ -178,53 +175,6 @@ class TestStage1FindPDF:
             assert "no output" in updated.failure_message.lower()
 
 
-class TestUrlRelevanceHeuristic:
-    """Tests for _url_likely_matches_model and helpers."""
-
-    def test_model_tokens_splits_on_punctuation_and_alpha_digit(self):
-        # Splits on '-' AND on letter/digit boundaries; chunks are kept too
-        # (so 'H6' or 'X32' survives intact); tokens of len < 2 are dropped;
-        # duplicates are removed in order.
-        assert _model_tokens("AVIO-AO2") == ["AVIO", "AO2", "AO"]
-        assert _model_tokens("Rio1608-D2") == ["Rio1608", "Rio", "1608", "D2"]
-        assert _model_tokens("ULXD4") == ["ULXD4", "ULXD"]
-        assert _model_tokens("SQ-5") == ["SQ"]
-
-    def test_looks_opaque_short_slugs_are_not_opaque(self):
-        # Short slugs are product codes, not hashes
-        assert _looks_opaque("adp") is False
-        assert _looks_opaque("ULXD4") is False
-
-    def test_looks_opaque_long_hex_is_opaque(self):
-        assert _looks_opaque("1078f753f2bbafa663cc873b1299a43e1fd6") is True
-
-    def test_looks_opaque_long_word_is_not_opaque(self):
-        # 12-char "datasheetxyz" — letters dominate, not a hash
-        assert _looks_opaque("datasheetxyz") is False
-
-    def test_url_matches_when_token_in_path(self):
-        # Real Stage 1 wins from prior runs
-        assert _url_likely_matches_model(
-            "https://pubs.shure.com/view/guide/ULXD/en-US.pdf", "ULXD4"
-        ) is True
-        assert _url_likely_matches_model(
-            "https://www.allen-heath.com/uploads/SQ-5-Technical-Datasheet.pdf", "SQ-5"
-        ) is True
-
-    def test_url_rejected_when_filename_is_wrong_product_code(self):
-        # The Audinate failure: AVIO-AO2 vs ADP.pdf
-        assert _url_likely_matches_model(
-            "https://cdn-docs.av-iq.com/dataSheet/ADP.pdf", "AVIO-AO2"
-        ) is False
-
-    def test_url_accepted_when_filename_is_opaque_hash(self):
-        # The Sennheiser case — gzhls.at content hash
-        assert _url_likely_matches_model(
-            "https://gzhls.at/blob/ldb/4/b/1/9/1078f753f2bbafa663cc873b1299a43e1fd6.pdf",
-            "EW-DX-EM",
-        ) is True
-
-
 class TestStage1Retry:
     """Tests for retry behavior on empty output and rejected URLs."""
 
@@ -252,8 +202,8 @@ class TestStage1Retry:
             assert updated.pdf_url == "https://example.com/Rio1608-D2-datasheet.pdf"
 
     @pytest.mark.asyncio
-    async def test_retries_on_wrong_device_url_then_succeeds(self, tmp_manifest, monkeypatch):
-        """First Kimi call returns Audinate-style wrong-device URL; retry succeeds with right one."""
+    async def test_accepts_agent_url_without_filename_filter(self, tmp_manifest, monkeypatch):
+        """Agent-returned URLs are trusted; no filename-based rejection."""
         node = DeviceNode(
             device_id="audinate-avio-ao2",
             manufacturer="AUDINATE",
@@ -262,22 +212,20 @@ class TestStage1Retry:
         tmp_manifest.add_node(node)
         monkeypatch.setattr("src.pipeline_stages.settings.find_secondary_docs", False)
 
-        wrong = json.dumps({"pdf_url": "https://cdn-docs.av-iq.com/dataSheet/ADP.pdf"})
-        right = json.dumps({"pdf_url": "https://www.audinate.com/avio-ao2-datasheet.pdf"})
+        # Even though "ADP.pdf" doesn't match "AVIO-AO2", the agent chose it
+        # and we no longer second-guess with filename heuristics.
+        url = json.dumps({"pdf_url": "https://cdn-docs.av-iq.com/dataSheet/ADP.pdf"})
         with patch(
             "src.kimi_runner.run_kimi", new_callable=AsyncMock
         ) as mock_kimi:
-            mock_kimi.side_effect = [wrong, right]
+            mock_kimi.return_value = url
 
             result = await stage_1_find_pdf(node, tmp_manifest)
 
             assert result is True
-            assert mock_kimi.await_count == 2
-            # Second prompt must mention the rejected URL so Kimi avoids it
-            second_prompt = mock_kimi.await_args_list[1].args[0]
-            assert "ADP.pdf" in second_prompt
+            assert mock_kimi.await_count == 1
             updated = tmp_manifest.get_node("audinate-avio-ao2")
-            assert updated.pdf_url == "https://www.audinate.com/avio-ao2-datasheet.pdf"
+            assert updated.pdf_url == "https://cdn-docs.av-iq.com/dataSheet/ADP.pdf"
 
     @pytest.mark.asyncio
     async def test_all_retries_fail(self, sample_node, tmp_manifest):
@@ -323,22 +271,23 @@ class TestSecondaryDocSearch:
             assert docs[0].local_path is None
 
     @pytest.mark.asyncio
-    async def test_secondary_url_mismatch_rejected(self, sample_node, tmp_manifest):
-        """URL whose filename doesn't match model → returns None, no row written."""
+    async def test_secondary_url_accepted_despite_filename_mismatch(self, sample_node, tmp_manifest):
+        """Secondary docs skip filename filtering; agent judgment is trusted."""
         tmp_manifest.add_node(sample_node)
-        wrong_url = "https://cdn-docs.av-iq.com/dataSheet/ADP.pdf"
+        url = "https://cdn-docs.av-iq.com/dataSheet/ADP.pdf"
         with patch(
             "src.kimi_runner.run_kimi", new_callable=AsyncMock
         ) as mock_kimi:
-            mock_kimi.return_value = json.dumps({"pdf_url": wrong_url})
+            mock_kimi.return_value = json.dumps({"pdf_url": url})
             result = await _find_secondary_doc(
                 sample_node, tmp_manifest, DOC_TYPE_INSTALL_GUIDE
             )
-            assert result is None
+            assert result == url
             docs = tmp_manifest.list_documents(
                 sample_node.device_id, DOC_TYPE_INSTALL_GUIDE
             )
-            assert docs == []
+            assert len(docs) == 1
+            assert docs[0].url == url
 
     @pytest.mark.asyncio
     async def test_secondary_kimi_exception_swallowed(self, sample_node, tmp_manifest):

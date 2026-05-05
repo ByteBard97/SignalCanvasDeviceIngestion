@@ -49,6 +49,7 @@ compiler = [
 testpaths = ["tests"]
 python_files = "test_*.py"
 asyncio_mode = "auto"
+pythonpath = ["src"]
 
 [tool.black]
 line-length = 100
