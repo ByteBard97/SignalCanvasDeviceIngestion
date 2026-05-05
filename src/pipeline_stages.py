@@ -1310,9 +1310,6 @@ async def stage_5_extract_specs(
     """
     async with EXTRACTION_SEMAPHORE:
         try:
-            # Perform RAG search for device context
-            # TODO: Implement RAG search and Haiku agent call
-            # For now, placeholder for extraction logic
             spec_json = await _extract_specs_via_agent(
                 manufacturer=node.manufacturer,
                 model=node.model,
