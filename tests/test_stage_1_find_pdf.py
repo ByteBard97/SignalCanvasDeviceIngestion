@@ -39,8 +39,31 @@ def sample_node():
     )
 
 
+@pytest.fixture
+def disable_av_iq(monkeypatch):
+    """Force tests through the Kimi path by disabling Stage 1 fallbacks.
+
+    Stage 1 short-circuits to a known URL when the device matches the AV-iQ
+    index, and falls back to a real DuckDuckGo search if Kimi exhausts. These
+    tests mock Kimi and assert on its result, so both fallbacks are disabled.
+    """
+    monkeypatch.setattr(
+        "src.pipeline_stages._av_iq_url_for_device", lambda manufacturer, model: None
+    )
+
+    async def _noop_ddg(*args, **kwargs):
+        return None
+    monkeypatch.setattr(
+        "src.pipeline_stages._search_duckduckgo_for_pdf", _noop_ddg
+    )
+
+
 class TestStage1FindPDF:
     """Tests for stage_1_find_pdf."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_av_iq(self, disable_av_iq):
+        pass
 
     @pytest.mark.asyncio
     async def test_stage_1_success(self, sample_node, tmp_manifest):
@@ -159,10 +182,12 @@ class TestUrlRelevanceHeuristic:
     """Tests for _url_likely_matches_model and helpers."""
 
     def test_model_tokens_splits_on_punctuation_and_alpha_digit(self):
-        # Splits on '-' AND on letter/digit boundaries; tokens of len < 2 are dropped.
-        assert _model_tokens("AVIO-AO2") == ["AVIO", "AO"]
-        assert _model_tokens("Rio1608-D2") == ["Rio", "1608"]
-        assert _model_tokens("ULXD4") == ["ULXD"]
+        # Splits on '-' AND on letter/digit boundaries; chunks are kept too
+        # (so 'H6' or 'X32' survives intact); tokens of len < 2 are dropped;
+        # duplicates are removed in order.
+        assert _model_tokens("AVIO-AO2") == ["AVIO", "AO2", "AO"]
+        assert _model_tokens("Rio1608-D2") == ["Rio1608", "Rio", "1608", "D2"]
+        assert _model_tokens("ULXD4") == ["ULXD4", "ULXD"]
         assert _model_tokens("SQ-5") == ["SQ"]
 
     def test_looks_opaque_short_slugs_are_not_opaque(self):
@@ -202,6 +227,10 @@ class TestUrlRelevanceHeuristic:
 
 class TestStage1Retry:
     """Tests for retry behavior on empty output and rejected URLs."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_av_iq(self, disable_av_iq):
+        pass
 
     @pytest.mark.asyncio
     async def test_retries_on_empty_output_then_succeeds(self, sample_node, tmp_manifest, monkeypatch):

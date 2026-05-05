@@ -92,7 +92,10 @@ def _model_tokens(model: str) -> list[str]:
         # Also split letter→digit and digit→letter transitions
         for sub in re.findall(r"[A-Za-z]+|[0-9]+", chunk):
             tokens.append(sub)
-    result = [t for t in tokens if len(t) >= _MODEL_TOKEN_MIN_LEN]
+    filtered = [t for t in tokens if len(t) >= _MODEL_TOKEN_MIN_LEN]
+    # Order-preserving dedupe — duplicate tokens add no matching power and
+    # clutter logs / test assertions.
+    result = list(dict.fromkeys(filtered))
     # Fallback: if nothing survived, try the stripped model name as one token
     if not result:
         stripped = re.sub(r"[^A-Za-z0-9]", "", model)
@@ -344,6 +347,18 @@ def _build_fallback_url_prompt(
     )
 
 
+def _looks_canonical_sku(model: str) -> bool:
+    """True if model looks like a canonical SKU and Stage 0 can skip Kimi.
+
+    Heuristic: contains a digit + letter, or is short with uppercase letters
+    (common for pro-audio gear like "CL1", "ATEM Mini Extreme ISO", "EW 100 G4").
+    """
+    has_digit = any(c.isdigit() for c in model)
+    has_upper = any(c.isupper() for c in model)
+    has_letter = any(c.isalpha() for c in model)
+    return (has_digit and has_letter) or (has_upper and len(model) <= 30)
+
+
 def _build_resolve_sku_prompt(manufacturer: str, alias: str) -> str:
     """Build the Stage 0 Kimi prompt — alias to canonical manufacturer SKU."""
     return (
@@ -384,19 +399,13 @@ async def stage_0_resolve_sku(
         return True
 
     # Fast-path: if the model already looks like a canonical SKU, skip the
-    # expensive Kimi CLI call. Heuristic: contains a digit + letter, or is
-    # short with uppercase letters (common for pro-audio gear like "CL1",
-    # "ATEM Mini Extreme ISO", "EW 100 G4").
-    model = node.model
-    has_digit = any(c.isdigit() for c in model)
-    has_upper = any(c.isupper() for c in model)
-    has_letter = any(c.isalpha() for c in model)
-    if (has_digit and has_letter) or (has_upper and len(model) <= 30):
-        node.canonical_sku = model
-        node.canonical_product_name = model
+    # expensive Kimi CLI call.
+    if _looks_canonical_sku(node.model):
+        node.canonical_sku = node.model
+        node.canonical_product_name = node.model
         node.stage_resolve_sku = STAGE_COMPLETED
         manifest.persist(node)
-        logger.info(f"Device {node.device_id} fast-path SKU resolution: {model!r}")
+        logger.info(f"Device {node.device_id} fast-path SKU resolution: {node.model!r}")
         return True
 
     async with RESOLVE_SKU_SEMAPHORE:

@@ -125,7 +125,7 @@ def test_ragscallion_connectivity():
             timeout=5,
         )
         assert response.status_code == 200
-        assert response.text == "ok"
+        assert response.json().get("status") == "ok"
         logger.info("✓ Ragscallion server is reachable and healthy")
     except requests.ConnectionError as e:
         pytest.skip(f"Ragscallion server not reachable: {e}")

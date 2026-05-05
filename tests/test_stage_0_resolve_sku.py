@@ -48,6 +48,18 @@ class TestResolvedSkuHelper:
 
 
 class TestStage0ResolveSku:
+    @pytest.fixture(autouse=True)
+    def disable_fastpath(self, monkeypatch):
+        """Force every test in this class through the Kimi-resolution path.
+
+        Stage 0's fast-path heuristic (any model with digits+letters or short
+        uppercase) bypasses Kimi entirely. These tests are about Kimi handling,
+        so disable it here.
+        """
+        monkeypatch.setattr(
+            "src.pipeline_stages._looks_canonical_sku", lambda model: False
+        )
+
     @pytest.mark.asyncio
     async def test_alias_resolved_to_canonical_sku(self, alias_node, tmp_manifest):
         """Audinate alias case: AVIO-AO2 -> ADP-DAO-AU-0X2."""
