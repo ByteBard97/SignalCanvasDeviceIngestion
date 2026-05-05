@@ -14,6 +14,7 @@ from src.harness.manifest import (
     DeviceNode,
     Manifest,
     QUEUE_1_CANNOT_FIND_PDF,
+    DOC_TYPE_SPEC_SHEET,
 )
 from src.pipeline_stages import STAGE_COMPLETED, STAGE_FAILED
 from src.pipeline_stages import stage_2_download_pdf
@@ -156,6 +157,17 @@ class TestStage2FallbackUrl:
             assert updated.stage_download_pdf == STAGE_COMPLETED
             # The successful URL is now persisted on the node
             assert updated.pdf_url == alt_url
+
+            # Regression: device_documents must contain a spec_sheet row for
+            # the URL that actually downloaded, with local_path set. Earlier
+            # set_document_local_path was a strict UPDATE-by-URL and silently
+            # no-op'd when the fallback URL didn't match the originally-
+            # recorded one — leaving the audit row forever incomplete.
+            spec_docs = tmp_manifest.list_documents("test-device", DOC_TYPE_SPEC_SHEET)
+            working = [d for d in spec_docs if d.url == alt_url]
+            assert len(working) == 1
+            assert working[0].local_path is not None
+            assert working[0].local_path.endswith(".pdf")
 
     @respx.mock
     @pytest.mark.asyncio

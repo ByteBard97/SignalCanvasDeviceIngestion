@@ -952,6 +952,17 @@ async def stage_2_download_pdf(
             node.pdf_url = current_url
             node.pdf_path = str(pdf_path)
             node.stage_download_pdf = STAGE_COMPLETED
+            # When _request_alternate_pdf_url returned a different URL than
+            # the one Stage 1 recorded, no spec_sheet row exists for
+            # current_url — UPDATE-by-URL would silently no-op and the row
+            # would stay forever without local_path or job_id. Insert-or-
+            # ignore first, then update local_path on whichever row matches.
+            manifest.add_document(
+                node.device_id,
+                DOC_TYPE_SPEC_SHEET,
+                url=current_url,
+                local_path=str(pdf_path),
+            )
             manifest.set_document_local_path(
                 node.device_id,
                 DOC_TYPE_SPEC_SHEET,
