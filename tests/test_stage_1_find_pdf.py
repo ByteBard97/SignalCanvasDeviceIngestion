@@ -14,10 +14,12 @@ from src.harness.manifest import (
 from src.pipeline_stages import STAGE_COMPLETED, STAGE_FAILED
 from src.pipeline_stages import (
     stage_1_find_pdf,
+    _find_secondary_doc,
     _url_likely_matches_model,
     _looks_opaque,
     _model_tokens,
 )
+from src.harness.manifest import DOC_TYPE_USER_MANUAL, DOC_TYPE_INSTALL_GUIDE
 
 
 @pytest.fixture
@@ -202,9 +204,10 @@ class TestStage1Retry:
     """Tests for retry behavior on empty output and rejected URLs."""
 
     @pytest.mark.asyncio
-    async def test_retries_on_empty_output_then_succeeds(self, sample_node, tmp_manifest):
+    async def test_retries_on_empty_output_then_succeeds(self, sample_node, tmp_manifest, monkeypatch):
         """First call returns None (Yamaha-style flake); second call returns valid URL."""
         tmp_manifest.add_node(sample_node)
+        monkeypatch.setattr("src.pipeline_stages.settings.find_secondary_docs", False)
 
         good = json.dumps({"pdf_url": "https://example.com/Rio1608-D2-datasheet.pdf"})
         with patch(
@@ -220,7 +223,7 @@ class TestStage1Retry:
             assert updated.pdf_url == "https://example.com/Rio1608-D2-datasheet.pdf"
 
     @pytest.mark.asyncio
-    async def test_retries_on_wrong_device_url_then_succeeds(self, tmp_manifest):
+    async def test_retries_on_wrong_device_url_then_succeeds(self, tmp_manifest, monkeypatch):
         """First Kimi call returns Audinate-style wrong-device URL; retry succeeds with right one."""
         node = DeviceNode(
             device_id="audinate-avio-ao2",
@@ -228,6 +231,7 @@ class TestStage1Retry:
             model="AVIO-AO2",
         )
         tmp_manifest.add_node(node)
+        monkeypatch.setattr("src.pipeline_stages.settings.find_secondary_docs", False)
 
         wrong = json.dumps({"pdf_url": "https://cdn-docs.av-iq.com/dataSheet/ADP.pdf"})
         right = json.dumps({"pdf_url": "https://www.audinate.com/avio-ao2-datasheet.pdf"})
@@ -263,3 +267,61 @@ class TestStage1Retry:
             updated = tmp_manifest.get_node("yamaha-rio1608-d2")
             assert updated.failure_category == "PDF_NOT_FOUND"
             assert updated.failure_retryable is True
+
+
+class TestSecondaryDocSearch:
+    """Tests for _find_secondary_doc — best-effort, single-attempt secondary lookups."""
+
+    @pytest.mark.asyncio
+    async def test_secondary_success_records_document(self, sample_node, tmp_manifest):
+        """Valid Kimi JSON for user_manual → row added to device_documents."""
+        tmp_manifest.add_node(sample_node)
+        manual_url = "https://example.com/Rio1608-D2-user-manual.pdf"
+        with patch(
+            "src.kimi_runner.run_kimi", new_callable=AsyncMock
+        ) as mock_kimi:
+            mock_kimi.return_value = json.dumps({"pdf_url": manual_url})
+            result = await _find_secondary_doc(
+                sample_node, tmp_manifest, DOC_TYPE_USER_MANUAL
+            )
+            assert result == manual_url
+            assert mock_kimi.await_count == 1
+            docs = tmp_manifest.list_documents(
+                sample_node.device_id, DOC_TYPE_USER_MANUAL
+            )
+            assert len(docs) == 1
+            assert docs[0].url == manual_url
+            assert docs[0].local_path is None
+
+    @pytest.mark.asyncio
+    async def test_secondary_url_mismatch_rejected(self, sample_node, tmp_manifest):
+        """URL whose filename doesn't match model → returns None, no row written."""
+        tmp_manifest.add_node(sample_node)
+        wrong_url = "https://cdn-docs.av-iq.com/dataSheet/ADP.pdf"
+        with patch(
+            "src.kimi_runner.run_kimi", new_callable=AsyncMock
+        ) as mock_kimi:
+            mock_kimi.return_value = json.dumps({"pdf_url": wrong_url})
+            result = await _find_secondary_doc(
+                sample_node, tmp_manifest, DOC_TYPE_INSTALL_GUIDE
+            )
+            assert result is None
+            docs = tmp_manifest.list_documents(
+                sample_node.device_id, DOC_TYPE_INSTALL_GUIDE
+            )
+            assert docs == []
+
+    @pytest.mark.asyncio
+    async def test_secondary_kimi_exception_swallowed(self, sample_node, tmp_manifest):
+        """Kimi raising → returns None, no row written, no exception bubbles up."""
+        tmp_manifest.add_node(sample_node)
+        with patch(
+            "src.kimi_runner.run_kimi", new_callable=AsyncMock
+        ) as mock_kimi:
+            mock_kimi.side_effect = RuntimeError("kimi exploded")
+            result = await _find_secondary_doc(
+                sample_node, tmp_manifest, DOC_TYPE_USER_MANUAL
+            )
+            assert result is None
+            docs = tmp_manifest.list_documents(sample_node.device_id)
+            assert docs == []

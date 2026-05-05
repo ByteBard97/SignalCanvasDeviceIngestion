@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     marker_timeout_seconds: int = 300
     marker_max_memory_gb: int = 8
 
+    # Multi-doc discovery: also search for user_manual and install_guide
+    # alongside the primary spec_sheet. Disable in batch runs to cut Kimi cost.
+    find_secondary_docs: bool = True
+
     class Config:
         # Use repo-relative path so .env is found regardless of CWD
         env_file = str(Path(__file__).parent.parent / ".env")

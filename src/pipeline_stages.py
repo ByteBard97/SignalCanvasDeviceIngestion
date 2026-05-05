@@ -28,7 +28,11 @@ from .harness.manifest import (
     STAGE_EXTRACT_SPECS,
     STAGE_RESOLVE_SKU,
     DOC_TYPE_SPEC_SHEET,
+    DOC_TYPE_USER_MANUAL,
+    DOC_TYPE_INSTALL_GUIDE,
 )
+from .config import settings
+from .prompts.finding_datasheets import build_doc_search_prompt
 from .ragscallion_client import (
     RagscallionClient,
     RagscallionCollisionError,
@@ -490,7 +494,23 @@ async def stage_1_find_pdf(
     node: DeviceNode,
     manifest: Manifest,
 ) -> bool:
-    """Stage 1: Find canonical manufacturer datasheet PDF URL via Kimi CLI.
+    """Stage 1: Find spec sheet (required) plus best-effort secondary docs.
+
+    Spec sheet failure → stage fails. Secondary docs (user_manual,
+    install_guide) are best-effort — failures are logged and ignored.
+    """
+    if not await _find_spec_sheet_url(node, manifest):
+        return False
+    if settings.find_secondary_docs:
+        await _gather_secondary_docs(node, manifest)
+    return True
+
+
+async def _find_spec_sheet_url(
+    node: DeviceNode,
+    manifest: Manifest,
+) -> bool:
+    """Find canonical manufacturer datasheet PDF URL via Kimi CLI.
 
     Input:
         node: Device node with manufacturer and model set.
@@ -631,6 +651,148 @@ async def stage_1_find_pdf(
             retryable=True,
         )
         return False
+
+
+async def _gather_secondary_docs(node: DeviceNode, manifest: Manifest) -> None:
+    """Best-effort search for non-spec-sheet docs in parallel. Never raises."""
+    results = await asyncio.gather(
+        _find_secondary_doc(node, manifest, DOC_TYPE_USER_MANUAL),
+        _find_secondary_doc(node, manifest, DOC_TYPE_INSTALL_GUIDE),
+        return_exceptions=True,
+    )
+    for doc_type, result in zip((DOC_TYPE_USER_MANUAL, DOC_TYPE_INSTALL_GUIDE), results):
+        if isinstance(result, Exception):
+            logger.warning(
+                f"Device {node.device_id}: {doc_type} search raised: {result}"
+            )
+
+
+async def _find_secondary_doc(
+    node: DeviceNode,
+    manifest: Manifest,
+    doc_type: str,
+) -> Optional[str]:
+    """One Kimi search for a secondary doc type. Records via add_document on hit.
+
+    Single attempt, no retry — secondary docs are best-effort. Returns the URL
+    on success or None on any failure (Kimi error, no match, validation reject).
+    """
+    async with FIND_PDF_SEMAPHORE:
+        from .kimi_runner import run_kimi, extract_json_block
+
+        repo_root = Path(__file__).resolve().parent.parent
+        skills_dir = repo_root / ".claude" / "skills"
+        sku_for_search = _resolved_sku(node)
+
+        existing_urls = [
+            d.url for d in manifest.list_documents(node.device_id, doc_type)
+            if d.url
+        ]
+        prompt = build_doc_search_prompt(
+            node.manufacturer, sku_for_search, doc_type, existing_urls
+        )
+
+        try:
+            stdout = await run_kimi(
+                prompt,
+                skills_dir=skills_dir,
+                work_dir=repo_root,
+                timeout=FIND_PDF_TIMEOUT_SECONDS,
+                max_steps=FIND_PDF_MAX_STEPS,
+            )
+        except Exception as e:
+            logger.warning(f"Device {node.device_id}: {doc_type} Kimi failed: {e}")
+            return None
+
+        if not stdout:
+            logger.info(f"Device {node.device_id}: no {doc_type} found (empty)")
+            return None
+
+        json_block = extract_json_block(stdout)
+        if not json_block:
+            logger.info(f"Device {node.device_id}: no {doc_type} found (unparseable)")
+            return None
+
+        try:
+            data = json.loads(json_block)
+        except json.JSONDecodeError:
+            logger.info(f"Device {node.device_id}: no {doc_type} found (bad JSON)")
+            return None
+
+        pdf_url = data.get("pdf_url") if isinstance(data, dict) else None
+        if not pdf_url or not isinstance(pdf_url, str):
+            logger.info(f"Device {node.device_id}: no {doc_type} found (null url)")
+            return None
+
+        pdf_url = pdf_url.strip()
+        if not pdf_url.lower().endswith(".pdf"):
+            if not await _verify_pdf_content_type(pdf_url):
+                logger.info(
+                    f"Device {node.device_id}: {doc_type} URL not a PDF, skipping: {pdf_url}"
+                )
+                return None
+
+        if not _url_likely_matches_model(pdf_url, sku_for_search) and \
+           not _url_likely_matches_model(pdf_url, node.model):
+            logger.info(
+                f"Device {node.device_id}: {doc_type} URL filename mismatch, skipping: {pdf_url}"
+            )
+            return None
+
+        manifest.add_document(node.device_id, doc_type, url=pdf_url)
+        logger.info(f"Device {node.device_id}: {doc_type} found: {pdf_url}")
+        return pdf_url
+
+
+async def _download_secondary_docs(
+    node: DeviceNode,
+    manifest: Manifest,
+    cache_dir: Path,
+) -> None:
+    """Best-effort download of every non-spec-sheet doc recorded for this device.
+
+    Each failure logs a warning and continues — secondary docs never fail Stage 2.
+    """
+    import httpx
+
+    docs = manifest.list_documents(node.device_id)
+    for doc in docs:
+        if doc.doc_type == DOC_TYPE_SPEC_SHEET:
+            continue
+        if not doc.url or doc.local_path:
+            continue
+
+        local_path = cache_dir / f"{node.device_id}__{doc.doc_type}.pdf"
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
+            ) as client:
+                resp = await client.get(
+                    doc.url,
+                    headers={
+                        **_BROWSER_HEADERS,
+                        "Referer": f"https://www.google.com/search?q={urllib.parse.quote(doc.url)}",
+                    },
+                )
+                resp.raise_for_status()
+            content = resp.content
+            if len(content) < 4 or content[:4] != b"%PDF":
+                logger.warning(
+                    f"Device {node.device_id}: {doc.doc_type} not a valid PDF, skipping"
+                )
+                continue
+            local_path.write_bytes(content)
+            manifest.set_document_local_path(
+                node.device_id, doc.doc_type, doc.url, str(local_path)
+            )
+            logger.info(
+                f"Device {node.device_id}: {doc.doc_type} downloaded to {local_path} "
+                f"({len(content)} bytes)"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Device {node.device_id}: {doc.doc_type} download failed: {e}"
+            )
 
 
 # Shared browser-like headers for requests that need to look like a real user
@@ -792,6 +954,8 @@ async def stage_2_download_pdf(
                 f"Device {node.device_id} PDF downloaded to {pdf_path} ({len(content)} bytes)"
                 + (f" via fallback URL {current_url}" if len(tried_urls) > 1 else "")
             )
+            if settings.find_secondary_docs:
+                await _download_secondary_docs(node, manifest, cache_dir)
             return True
 
         # Loop exited without success or explicit failure (shouldn't happen).

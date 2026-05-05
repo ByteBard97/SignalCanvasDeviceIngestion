@@ -40,14 +40,10 @@ Manifest's `failure_category` column is NULL for all 36 devices — historical f
 
 ## What's next
 
-### Phase B — Stage 1 multi-doc discovery (BLOCKED → now unblocked)
-`stage_1_find_pdf` currently only finds one PDF per device. Extend it to also search for user_manual and install_guide. New helper `_find_secondary_docs(node, doc_type)` runs one extra Kimi search per type, validates with the same content-type/URL-match heuristics, and writes via `manifest.add_document(...)`.
-- **Cost knob:** add `config.find_secondary_docs: bool` (default True) so batch runs can disable it.
-- **Failure semantics:** spec_sheet failure → stage fails (existing behavior). Secondary-doc failures → log warning, continue.
-- Use `build_doc_search_prompt()` from `src/prompts/finding_datasheets.py` to compose the Kimi prompt.
-- Stage 2 then iterates `manifest.list_documents(device_id)` and downloads each, calling `set_document_local_path` per row. Same failure semantics: spec_sheet required, secondaries best-effort.
+### Phase B — DONE
+`stage_1_find_pdf` now refactored: spec_sheet path runs in `_find_spec_sheet_url` (holds FIND_PDF_SEMAPHORE); after that returns success, `_gather_secondary_docs` runs user_manual + install_guide searches in parallel via `_find_secondary_doc` (each acquires the same semaphore independently — no nesting/deadlock). Each is single-attempt, best-effort: failures log a warning and continue. Stage 2 follows the spec_sheet download with `_download_secondary_docs` which iterates `manifest.list_documents` and downloads each non-spec-sheet to `cache_dir / "<device_id>__<doc_type>.pdf"`. New tests in `tests/test_stage_1_find_pdf.py::TestSecondaryDocSearch` cover happy path, URL mismatch rejection, and exception swallowing. Cost knob: `config.find_secondary_docs` (default True).
 
-### Phase C — Stage 3 multi-doc ragscallion submission (depends on B)
+### Phase C — Stage 3 multi-doc ragscallion submission (ready to start)
 Currently `stage_3_4_submit_to_ragscallion` submits `node.pdf_path` and stores `node.ragscallion_job_id`. Change:
 - Iterate `list_documents(device_id)` where `local_path IS NOT NULL`. For each, call `submit_ingest` and store the per-doc job_id. **Need new helper:** `set_document_job_id(doc_id, job_id)` that does NOT touch indexed_at — split submission from index-completion (current `mark_document_indexed` conflates them).
 - Polling loop (`src/polling_loop.py`): for each device in QUEUE_2, iterate its docs and poll any with `ragscallion_job_id IS NOT NULL AND indexed_at IS NULL`. When the spec_sheet finishes indexing, mark `stage_index_rag COMPLETED` and advance the queue. Secondary docs continue polling in background.
@@ -73,7 +69,7 @@ Currently `stage_3_4_submit_to_ragscallion` submits `node.pdf_path` and stores `
 - **Ragscallion:** server runs at `192.168.0.200:8086` on a Linux box (Geoff has SSH as `your-username@localhost`). Vector store. Schema-flexible — already accepts arbitrary `submit_ingest` calls; multi-doc per device key works server-side without changes.
 
 ## Tasks (state at handoff)
-1-2 completed (Stage 1/2 wiring), 3 deleted (superseded by 6), 4 completed-with-note (Phase A abandoned), 7-10 completed (D+E plus reviewer fixes), 5 (Phase B) and 6 (Phase C) still pending. 5 is blocked-by 7 which is now done — 5 is ready to start.
+1-2 completed (Stage 1/2 wiring), 3 deleted (superseded by 6), 4 completed-with-note (Phase A abandoned), 5 completed (Phase B), 7-10 completed (D+E plus reviewer fixes). 6 (Phase C) is ready to start.
 
 ## Last advisor feedback worth keeping
 - For Phase C, partial-failure semantics: spec_sheet must succeed for stage_index_rag = COMPLETED; secondaries are best-effort (mirrors Phase B).
