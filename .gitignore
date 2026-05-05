@@ -65,3 +65,11 @@ package-lock.json
 # Rust (if building locally)
 target/
 Cargo.lock
+/.knowledge-graph
+av_iq_matches.json
+random_10_devices.json
+random_10_devices.txt
+random_10_devices_v2.json
+random_10_devices_v2.txt
+retry_1_device.txt
+retry_7_devices.txt
