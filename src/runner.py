@@ -259,6 +259,11 @@ def _run_patchify_fast_path(
     fast_nodes: list[DeviceNode] = []
 
     for node in nodes:
+        # Safety guard: never touch nodes that already have pipeline progress.
+        # This protects PDF-extracted devices from being overwritten on re-runs.
+        if node.stage_find_pdf != STAGE_NOT_STARTED or node.specs_json:
+            continue
+
         specs = extract_specs_from_patchify(node.device_id)
         if not specs:
             continue
