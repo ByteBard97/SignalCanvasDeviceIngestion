@@ -307,7 +307,7 @@ def test_audinate_avio_ao2_analog_placeholder() -> None:
 
 
 def test_required_port_enforcement_adds_placeholder() -> None:
-    """If a required category is missing, a placeholder must appear."""
+    """Placeholder injection is disabled; no placeholders added even when required categories are missing."""
     extracted = {
         "signal_flow": {
             "ports": [
@@ -325,4 +325,4 @@ def test_required_port_enforcement_adds_placeholder() -> None:
     result = normalize_extraction(extracted, "wireless_rx")
     ports = result["signal_flow"]["ports"]
     placeholders = [p for p in ports if p.get("_placeholder")]
-    assert len(placeholders) == 2  # analog_port + antenna_port
+    assert len(placeholders) == 0  # placeholder injection disabled

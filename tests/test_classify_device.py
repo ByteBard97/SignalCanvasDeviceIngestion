@@ -97,3 +97,33 @@ def test_classify_case_insensitive(manufacturer: str, model: str, expected_class
     result = _classify_by_rule(manufacturer, model)
     assert result is not None
     assert result.class_ == expected_class
+
+
+# ---------------------------------------------------------------------------
+# IT / Networking — out of scope
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "manufacturer,model",
+    [
+        ("Cisco", "SF200-24"),
+        ("Cisco", "Catalyst 9300"),
+        ("Ubiquiti", "USW-Enterprise-8-PoE"),
+        ("Ubiquiti", "UDM-Pro"),
+        ("MikroTik", "CRS305-1G-4S+IN"),
+        ("Aruba", "AP-535"),
+        ("Juniper", "SRX300"),
+        ("Fortinet", "FortiGate 60F"),
+        ("TP-Link", "TL-SG108"),
+        ("Netgear", "GS308"),
+        ("HP", "Aruba 2930F"),
+        ("HPE", "FlexNetwork 5130"),
+    ],
+)
+def test_classify_it_networking_by_rule(manufacturer: str, model: str) -> None:
+    """Known networking gear must be classified as it_networking at the rule tier."""
+    result = _classify_by_rule(manufacturer, model)
+    assert result is not None
+    assert result.class_ == "it_networking"
+    assert result.source == "rule"

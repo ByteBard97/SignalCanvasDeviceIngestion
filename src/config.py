@@ -42,8 +42,9 @@ class Settings(BaseSettings):
     marker_max_memory_gb: int = 8
 
     # Multi-doc discovery: also search for user_manual and install_guide
-    # alongside the primary spec_sheet. Disable in batch runs to cut Kimi cost.
-    find_secondary_docs: bool = True
+    # alongside the primary spec_sheet. Disabled by default in batch runs to
+    # cut Kimi cost and runtime (~15-20 min saved per 20-device batch).
+    find_secondary_docs: bool = False
 
     class Config:
         # Use repo-relative path so .env is found regardless of CWD

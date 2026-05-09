@@ -44,6 +44,25 @@ class Classification:
 # Rule table: list of (manufacturer_pattern, model_pattern, class_)
 # ---------------------------------------------------------------------------
 RULE_TABLE: list[tuple[str, str, str]] = [
+    # IT / Networking — explicitly out of scope for SignalCanvas
+    (r"Cisco", r"SF.*|Catalyst.*|Nexus.*|ISR.*|ASA.*|Meraki.*|SG.*|CBS.*", "it_networking"),
+    (r"Ubiquiti", r"USW.*|UDM.*|USG.*|EdgeRouter.*|EdgeSwitch.*|UAP.*", "it_networking"),
+    (r"MikroTik", r"CRS.*|CCR.*|RB.*|hEX.*|CRS.*", "it_networking"),
+    (r"Aruba", r".*", "it_networking"),
+    (r"Juniper", r".*", "it_networking"),
+    (r"Fortinet", r".*", "it_networking"),
+    (r"Palo\s+Alto", r".*", "it_networking"),
+    (r"TP-Link", r".*", "it_networking"),
+    (r"Netgear", r".*", "it_networking"),
+    (r"D-Link", r".*", "it_networking"),
+    (r"Linksys", r".*", "it_networking"),
+    (r"HP", r".*", "it_networking"),
+    (r"HPE", r".*", "it_networking"),
+    (r"Dell", r"PowerConnect.*|Networking.*", "it_networking"),
+    (r"SonicWall", r".*", "it_networking"),
+    (r"WatchGuard", r".*", "it_networking"),
+    (r"Extreme", r".*", "it_networking"),
+    (r"Ruckus", r".*", "it_networking"),
     # Dante stageboxes
     (r"Yamaha", r"Rio.*", "dante_stagebox"),
     # Dante input adapters (analog → Dante)
@@ -66,6 +85,7 @@ VALID_CLASSES = {
     "wireless_rx",
     "mixing_console",
     "dsp_processor",
+    "it_networking",
     "generic",
 }
 
@@ -94,9 +114,14 @@ def _classify_by_rule(manufacturer: str, model: str) -> Optional[Classification]
 
 _CLASSIFICATION_SYSTEM_PROMPT = (
     "You are a device classifier for professional audio/video equipment. "
+    "SignalCanvas documents AV signal flow (mixers, speakers, cameras, switchers, DSP, etc.) "
+    "and explicitly does NOT document IT/networking infrastructure.\n\n"
     "Given a manufacturer and model, emit exactly one classification token from this list:\n"
     "dante_stagebox, dante_adapter_input, dante_adapter_output, "
-    "wireless_rx, mixing_console, dsp_processor, generic\n"
+    "wireless_rx, mixing_console, dsp_processor, it_networking, generic\n\n"
+    "Use 'it_networking' for switches, routers, firewalls, access points, and other pure "
+    "networking/IT infrastructure. Use 'generic' for any AV device that does not fit the "
+    "specific categories above.\n"
     "Respond with ONLY the token, no punctuation or explanation."
 )
 

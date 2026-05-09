@@ -30,6 +30,10 @@ class FailureCategory(str, Enum):
     PDF_DOWNLOAD_FAILED = "PDF_DOWNLOAD_FAILED"     # retryable: yes (retry download)
     PDF_INVALID = "PDF_INVALID"                     # retryable: no (file corrupt)
 
+    # Stage 1b failures (HTML source acquisition — fallback when PDF not found)
+    HTML_SOURCE_NOT_FOUND = "HTML_SOURCE_NOT_FOUND"       # retryable: yes (user can provide URL)
+    HTML_SOURCE_FETCH_FAILED = "HTML_SOURCE_FETCH_FAILED" # retryable: yes (network/temp issue)
+
     # Stage 3 failure (PDF conversion)
     MARKER_FAILED = "MARKER_FAILED"                 # retryable: yes (Marker bug)
     MARKER_TIMEOUT = "MARKER_TIMEOUT"               # retryable: yes (longer timeout)
@@ -49,6 +53,8 @@ class FailureCategory(str, Enum):
 
     # Stage 7 failure (validation)
     PATCH_VALIDATION_FAILED = "PATCH_VALIDATION_FAILED"  # retryable: no (fix generation)
+
+    OUT_OF_SCOPE = "OUT_OF_SCOPE"                   # retryable: no (product decision)
 
     UNKNOWN = "UNKNOWN"                             # retryable: unknown
 
@@ -102,7 +108,7 @@ class DeviceDocument:
 
     def __post_init__(self):
         if self.created_at is None:
-            self.created_at = datetime.now().isoformat()
+            self.created_at = datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -162,9 +168,9 @@ class DeviceNode:
     def __post_init__(self):
         """Initialize timestamps if not set."""
         if self.created_at is None:
-            self.created_at = datetime.now().isoformat()
+            self.created_at = datetime.now(timezone.utc).isoformat()
         if self.updated_at is None:
-            self.updated_at = datetime.now().isoformat()
+            self.updated_at = datetime.now(timezone.utc).isoformat()
 
 
 class IngestionNode(BaseModel):
@@ -233,7 +239,7 @@ class IngestionNode(BaseModel):
             "stage": stage,
             "category": category.value,
             "message": message,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         self.last_failure = category
         self.attempt_count += 1
@@ -359,7 +365,7 @@ class Manifest:
             "SELECT device_id, pdf_url, pdf_path FROM device_nodes "
             "WHERE pdf_url IS NOT NULL OR pdf_path IS NOT NULL"
         ).fetchall()
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         for device_id, pdf_url, pdf_path in rows:
             existing = conn.execute(
                 "SELECT 1 FROM device_documents WHERE device_id = ? AND doc_type = ?",
@@ -420,14 +426,14 @@ class Manifest:
         for stage_col in stages:
             if getattr(node, stage_col) == 1:
                 setattr(node, stage_col, 0)
-        node.updated_at = datetime.now().isoformat()
+        node.updated_at = datetime.now(timezone.utc).isoformat()
         self._persist_node(node, conn)
 
     def _restart_ragscallion_polling(self, node: DeviceNode, conn: sqlite3.Connection):
         """Re-poll Ragscallion for job status after crash."""
         if node.ragscallion_job_id:
             node.queue = QUEUE_2_POLLING_RAGSCALLION
-            node.updated_at = datetime.now().isoformat()
+            node.updated_at = datetime.now(timezone.utc).isoformat()
             self._persist_node(node, conn)
 
     def _node_to_row(self, node: DeviceNode) -> tuple:
@@ -521,7 +527,7 @@ class Manifest:
         """
         device_node = self._ensure_device_node(node)
         with sqlite3.connect(self.db_path) as conn:
-            device_node.updated_at = datetime.now().isoformat()
+            device_node.updated_at = datetime.now(timezone.utc).isoformat()
             self._persist_node(device_node, conn)
             conn.commit()
 
@@ -586,7 +592,7 @@ class Manifest:
         node.failure_message = failure_message
         node.failure_retryable = retryable
         node.failure_attempts += 1
-        node.failure_at = datetime.now().isoformat()
+        node.failure_at = datetime.now(timezone.utc).isoformat()
         self.persist(node)
 
     def log_usage(
@@ -756,13 +762,13 @@ class Manifest:
             if ragscallion_job_id is None:
                 conn.execute(
                     "UPDATE device_documents SET indexed_at = ? WHERE id = ?",
-                    (datetime.now().isoformat(), doc_id),
+                    (datetime.now(timezone.utc).isoformat(), doc_id),
                 )
             else:
                 conn.execute(
                     "UPDATE device_documents SET indexed_at = ?, ragscallion_job_id = ? "
                     "WHERE id = ?",
-                    (datetime.now().isoformat(), ragscallion_job_id, doc_id),
+                    (datetime.now(timezone.utc).isoformat(), ragscallion_job_id, doc_id),
                 )
             conn.commit()
 

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -244,10 +245,10 @@ class RagscallionClient:
         source_label: str,
         on_conflict: str = "error",
     ) -> dict:
-        """Submit PDF for async ingestion to Ragscallion.
+        """Submit a source document for async ingestion to Ragscallion.
 
         Args:
-            pdf_path: Local path to PDF file
+            pdf_path: Local path to source file (.pdf, .md, .txt, .html)
             corpus_id: Corpus identifier (e.g., "yamaha-r08d")
             source_label: Human-readable label (e.g., "YAMAHA R08D")
             on_conflict: "error" (reject collision), "append", or "replace"
@@ -266,18 +267,29 @@ class RagscallionClient:
             RagscallionUnavailableError: After 3 retries on 5xx/timeout
         """
         url = f"{self.base_url}/ingest"
+        path = Path(pdf_path)
 
-        # Read PDF file as binary
+        # Read file as binary (works for both text and binary formats)
         with open(pdf_path, "rb") as f:
-            pdf_data = f.read()
+            file_data = f.read()
+
+        # Determine filename and MIME type from actual extension
+        filename = path.name
+        ext_to_mime = {
+            ".pdf": "application/pdf",
+            ".md": "text/markdown",
+            ".txt": "text/plain",
+            ".html": "text/html",
+            ".htm": "text/html",
+        }
+        content_type = ext_to_mime.get(path.suffix.lower(), "application/octet-stream")
 
         # Prepare multipart form data
-        # aiohttp and httpx handle this differently
         if ASYNC_LIB == "aiohttp":
             import aiohttp
 
             form = aiohttp.FormData()
-            form.add_field("file", pdf_data, filename="document.pdf")
+            form.add_field("file", file_data, filename=filename, content_type=content_type)
             form.add_field("corpus_id", corpus_id)
             form.add_field("source_label", source_label)
             form.add_field("on_conflict", on_conflict)
@@ -291,7 +303,7 @@ class RagscallionClient:
 
         elif ASYNC_LIB == "httpx":
             files = {
-                "file": ("document.pdf", pdf_data, "application/pdf"),
+                "file": (filename, file_data, content_type),
                 "corpus_id": (None, corpus_id),
                 "source_label": (None, source_label),
                 "on_conflict": (None, on_conflict),

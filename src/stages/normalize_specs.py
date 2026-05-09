@@ -184,9 +184,11 @@ _PLACEHOLDER_SPECS: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 
 
-def _canonicalize_name(name: str) -> str:
+def _canonicalize_name(name: str | None) -> str:
     """Map semantically-equivalent port names to a canonical form."""
-    # Strip leading numbers like "14 Assignable Local Outputs" → "Assignable Local Outputs"
+    if not name:
+        return ""
+    # Strip leading numbers like "14 Assignable Local Outputs" -> "Assignable Local Outputs"
     cleaned = re.sub(r"^\d+\s*", "", name)
     lowered = cleaned.lower()
     for canonical, patterns in _NAME_RULES:
@@ -197,7 +199,6 @@ def _canonicalize_name(name: str) -> str:
             if re.search(regex, lowered):
                 return canonical
     return cleaned
-
 
 def _standardize_direction(direction: str | None, name: str) -> str | None:
     """Standardize direction strings and infer from name if missing."""
@@ -416,15 +417,59 @@ _SINGLE_CONNECTOR_PORTS: list[str] = [
     "aes3 output",
 ]
 
+# Digital protocols where a single connector carries many audio channels.
+# When matched, high channel counts should be treated as 1 physical port.
+_CHANNEL_BASED_PROTOCOLS: list[str] = [
+    "dante", "qlan", "madi", "aes50", "ultranet", "p16", "soundgrid",
+    "optocore", "omneo", "gigaace", "dmx", "dmx512", "network", "nd",
+]
+
+# Connectors that typically carry multiplexed channels rather than representing
+# multiple identical physical connectors in a row.
+_MULTIPLEXED_CONNECTORS: set[str] = {
+    "rj45", "ethercon", "ethernet", "bnc_75", "bnc", "sc_fiber",
+    "lc_fiber", "sfp", "hdmi", "displayport", "usb", "usb-a", "usb-b",
+    "usb-c", "coaxial", "optical", "fiber",
+}
+
 
 def _correct_channels(port: dict) -> None:
     """Fix common channel-count miscounts (audio channels vs physical connectors)."""
     name = (port.get("name") or "").lower()
+    connector = (port.get("connector") or "").lower().replace("-", "_")
+    channels = port.get("channels")
+
+    if not isinstance(channels, int) or channels <= 1:
+        return
+
+    # Always-single-connector ports (headphone, talkback, AES)
     for pattern in _SINGLE_CONNECTOR_PORTS:
         if pattern in name:
-            # A headphone jack, talkback XLR, or AES output is ONE physical connector
             port["channels"] = None
-            break
+            return
+
+    # Channel-based protocols on multiplexed connectors:
+    # e.g., "64 Dante channels over 1 RJ45" should be 1 port, not 64.
+    # Also catches "Dante_Pri_Out[1..2]" which is always 1 physical port.
+    has_protocol = any(p in name for p in _CHANNEL_BASED_PROTOCOLS)
+    is_multiplexed = connector in _MULTIPLEXED_CONNECTORS or any(
+        c in connector for c in _MULTIPLEXED_CONNECTORS
+    )
+
+    if has_protocol and is_multiplexed and channels >= 2:
+        port["channels"] = 1
+        return
+
+    # Broad safety net: any multiplexed connector with a suspiciously high
+    # channel count is almost certainly audio-channel expansion.
+    if is_multiplexed and channels >= 32:
+        port["channels"] = 1
+        return
+
+    # DMX over XLR: 512 channels = 1 physical XLR port
+    if "dmx" in name and channels >= 128:
+        port["channels"] = 1
+        return
 
 
 def _placeholder_port(category: str) -> dict:
@@ -576,9 +621,13 @@ def normalize_extraction(extracted: dict, device_class: str) -> dict:
     merged_ports = _normalize_ports(signal_flow.get("ports") or [])
     deduped_bridges = _normalize_bridges(signal_flow.get("bridges") or [])
 
-    for cat in _REQUIRED_CATEGORIES.get(device_class, []):
-        if not _has_port_category(merged_ports, cat):
-            merged_ports.append(_placeholder_port(cat))
+    # NOTE: Previously we injected placeholder ports for missing required categories
+    # based on device classification. This caused phantom ports (e.g. Dante on a
+    # headphone amp) when the classifier was wrong or the PDF simply didn't mention
+    # the port. We now trust the extraction: if the PDF doesn't mention a port,
+    # it doesn't exist. Placeholders are only kept if they came from the LLM
+    # extraction itself (not injected here).
+    pass
 
     merged_ports.sort(key=lambda p: (p.get("direction") or "", p.get("name") or ""))
     deduped_bridges.sort()

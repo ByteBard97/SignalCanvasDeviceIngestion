@@ -24,6 +24,7 @@ from typing import Optional
 from .config import settings
 from .harness.manifest import (
     DeviceNode,
+    FailureCategory,
     Manifest,
     QUEUE_0_INITIAL,
     QUEUE_1_CANNOT_FIND_PDF,
@@ -39,8 +40,10 @@ from .harness.manifest import (
 )
 from .pipeline_stages import STAGE_NOT_STARTED
 from .pipeline_stages import (
+    _set_stage_failure,
     stage_0_resolve_sku,
     stage_1_find_pdf,
+    stage_1b_find_html_source,
     stage_2_download_pdf,
     stage_3_4_submit_to_ragscallion,
     stage_5_extract_specs,
@@ -60,7 +63,7 @@ STAGE_FAILED = 3
 logger = logging.getLogger(__name__)
 
 # Wall-clock hard cap (minutes)
-HARD_CAP_MINUTES = 30
+HARD_CAP_MINUTES = 90
 
 # Concurrency limits
 MAX_CONCURRENT_STAGE_1 = 3
@@ -112,6 +115,34 @@ async def _run_stage_1_batch(
             successful.append(node)
 
     logger.info(f"Stage 1 complete: {len(successful)}/{len(nodes)} succeeded")
+    return successful
+
+
+async def _run_stage_1b_batch(
+    manifest: Manifest,
+    nodes: list[DeviceNode],
+    cache_dir: Path,
+) -> list[DeviceNode]:
+    """Run Stage 1b (HTML fallback) on nodes that failed PDF search.
+
+    For each node, searches for an HTML product page, then either:
+    - Extracts clean Markdown (static pages) -> submits as .md
+    - Renders to PDF via Playwright (JS-heavy pages) -> submits as .pdf
+    """
+    if not nodes:
+        return []
+
+    tasks = [stage_1b_find_html_source(node, manifest, cache_dir) for node in nodes]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    successful: list[DeviceNode] = []
+    for node, result in zip(nodes, results):
+        if isinstance(result, Exception):
+            logger.error(f"Device {node.device_id} Stage 1b exception: {result}")
+        elif result:
+            successful.append(node)
+
+    logger.info(f"Stage 1b complete: {len(successful)}/{len(nodes)} HTML sources resolved")
     return successful
 
 
@@ -175,6 +206,112 @@ async def _run_stage_5_batch(
     return await process_stage_5_batch(manifest, ragscallion_client)
 
 
+async def _run_scope_check(nodes: list[DeviceNode], manifest: Manifest) -> list[DeviceNode]:
+    """Classify devices and reject IT/networking gear before any expensive work."""
+    kept: list[DeviceNode] = []
+    for node in nodes:
+        # Skip nodes that are already processed or failed
+        if node.queue != QUEUE_0_INITIAL:
+            kept.append(node)
+            continue
+
+        classification = await classify(node.manufacturer, node.model)
+        if classification.class_ == "it_networking":
+            logger.info(
+                f"Device {node.device_id}: REJECTED — classified as {classification.class_} "
+                f"({classification.source}, confidence={classification.confidence})"
+            )
+            node.failure_stage = STAGE_FIND_PDF  # 0 = before any real work
+            node.failure_category = FailureCategory.OUT_OF_SCOPE.value
+            node.failure_message = (
+                f"Out of scope: IT/networking device ({classification.source})"
+            )
+            node.failure_retryable = False
+            node.failure_attempts += 1
+            node.failure_at = datetime.now(timezone.utc).isoformat()
+            node.queue = QUEUE_4_MANUAL_REVIEW
+            manifest.persist(node)
+        else:
+            kept.append(node)
+
+    rejected = len(nodes) - len(kept)
+    if rejected:
+        logger.info(f"Scope check: {rejected} device(s) rejected as out-of-scope")
+    return kept
+
+
+def _run_patchify_fast_path(
+    nodes: list[DeviceNode],
+    manifest: Manifest,
+) -> list[DeviceNode]:
+    """Fast-path: generate specs from patchify inputs/outputs, skip PDF hunt.
+
+    For community entries that already have user-defined port data, we can
+    bypass Stage 0-5 entirely and jump straight to Stage 6-7 (patch generation).
+
+    Garbage filter:
+        - manufacturer == "Generic" AND zero ports AND no SKU  → reject
+        - Everything else with ports  → fast-track
+    """
+    from .stages.extract_patchify_ports import extract_specs_from_patchify
+    from .harness.manifest import QUEUE_5_COMPLETED
+
+    fast_nodes: list[DeviceNode] = []
+
+    for node in nodes:
+        specs = extract_specs_from_patchify(node.device_id)
+        if not specs:
+            continue
+
+        ports = specs.get("signal_flow", {}).get("ports", [])
+
+        # Garbage filter: Generic manufacturer + zero ports + no SKU
+        if (
+            node.manufacturer.strip().lower() == "generic"
+            and len(ports) == 0
+            and not _get_patchify_sku(node.device_id)
+        ):
+            logger.info(
+                f"Device {node.device_id}: rejected as garbage "
+                f"(Generic + zero ports + no SKU)"
+            )
+            _set_stage_failure(
+                node,
+                manifest,
+                stage=STAGE_FIND_PDF,
+                category=FailureCategory.PDF_NOT_FOUND,
+                message="Garbage entry: Generic manufacturer with no ports and no SKU",
+                retryable=False,
+            )
+            continue
+
+        # Store specs and mark stages 0-5 as completed
+        node.specs_json = json.dumps(specs)
+        node.stage_resolve_sku = STAGE_COMPLETED
+        node.stage_find_pdf = STAGE_COMPLETED
+        node.stage_download_pdf = STAGE_COMPLETED
+        node.stage_index_rag = STAGE_COMPLETED
+        node.stage_extract_specs = STAGE_COMPLETED
+        node.queue = QUEUE_5_COMPLETED
+        manifest.persist(node)
+        fast_nodes.append(node)
+        logger.info(
+            f"Device {node.device_id}: fast-tracked from patchify "
+            f"({len(ports)} port(s))"
+        )
+
+    return fast_nodes
+
+
+def _get_patchify_sku(device_id: str) -> Optional[str]:
+    """Return SKU from patchify entry, if any."""
+    from .stages.extract_patchify_ports import get_patchify_item
+    item = get_patchify_item(device_id)
+    if item:
+        return item.get("sku") or None
+    return None
+
+
 async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
     """Run Stage 6 (generate patch) and Stage 7 (validate) on queue_5 nodes."""
     from .stages.generate_patch import generate_patch
@@ -211,7 +348,28 @@ async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
             # Warn on low-confidence extractions — often means the PDF was a
             # marketing brochure rather than a technical manual.
             confidence = extracted.get("extraction_confidence", "").lower()
-            if confidence == "low":
+            ports = extracted.get("signal_flow", {}).get("ports", [])
+            if confidence == "low" and len(ports) == 0:
+                logger.warning(
+                    f"Device {node.device_id}: extraction confidence is LOW and "
+                    f"zero ports found — rejecting as insufficient data."
+                )
+                node.failure_stage = 5
+                node.failure_category = FailureCategory.EXTRACTION_FAILED.value
+                node.failure_message = (
+                    "Low confidence extraction with zero ports. "
+                    "The indexed PDF likely lacks technical I/O specifications."
+                )
+                node.failure_retryable = True
+                node.failure_attempts += 1
+                node.failure_at = datetime.now(timezone.utc).isoformat()
+                node.queue = QUEUE_4_MANUAL_REVIEW
+                node.stage_generate_patch = 3
+                manifest.persist(node)
+                failed += 1
+                continue
+
+            if confidence == "low" and len(ports) > 0:
                 logger.warning(
                     f"Device {node.device_id}: extraction confidence is LOW — "
                     f"the PDF may be a marketing brochure. Consider re-searching."
@@ -387,6 +545,26 @@ async def run_pipeline(
         logger.warning("No devices to process")
         return
 
+    # Scope check: reject IT/networking gear before spending money on PDF search/index/extract
+    nodes = await _run_scope_check(nodes, manifest)
+
+    if not nodes:
+        logger.warning("All devices were rejected as out-of-scope")
+        return
+
+    # Fast-path: generate specs directly from patchify inputs/outputs when available.
+    # This skips the expensive PDF hunt for community entries that already have
+    # user-defined port data.
+    patchify_fast_nodes = _run_patchify_fast_path(nodes, manifest)
+    if patchify_fast_nodes:
+        logger.info(
+            f"Patchify fast-path: {len(patchify_fast_nodes)} device(s) skipped "
+            f"PDF hunt (ports extracted from patchify inputs/outputs)"
+        )
+        # Exclude fast-path nodes from subsequent stages
+        fast_ids = {n.device_id for n in patchify_fast_nodes}
+        nodes = [n for n in nodes if n.device_id not in fast_ids]
+
     _summarize_device_status(nodes)
 
     logger.info(f"Starting pipeline for {len(nodes)} devices")
@@ -425,7 +603,21 @@ async def run_pipeline(
         stage_1_nodes = list({n.device_id: n for n in stage_0_done + queue_1_pending_pdf}.values())
         stage_1_success = await _run_stage_1_batch(manifest, stage_1_nodes)
 
-        # Stage 2: Download PDFs
+        # Stage 1b: HTML fallback for nodes that failed PDF search
+        html_fallback_nodes = [
+            n for n in manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
+            if n.failure_category == FailureCategory.PDF_NOT_FOUND.value
+            and n.failure_retryable
+            and n.failure_attempts <= 2  # Don't retry indefinitely
+        ]
+        stage_1b_task: Optional[asyncio.Task] = None
+        if html_fallback_nodes:
+            logger.info(f"Stage 1b: trying HTML fallback for {len(html_fallback_nodes)} device(s)")
+            stage_1b_task = asyncio.create_task(
+                _run_stage_1b_batch(manifest, html_fallback_nodes, cache_dir)
+            )
+
+        # Stage 2: Download PDFs (concurrently with Stage 1b)
         # Re-load nodes that completed stage 1 (queue may have changed)
         stage_1_done = [
             manifest.get_node(n.device_id)
@@ -439,6 +631,11 @@ async def run_pipeline(
         ]
         stage_2_nodes = list({n.device_id: n for n in stage_1_done + queue_1_pending_download}.values())
         stage_2_success = await _run_stage_2_batch(manifest, stage_2_nodes, cache_dir)
+
+        # Await Stage 1b results (if it was started)
+        if stage_1b_task:
+            stage_1b_success = await stage_1b_task
+            logger.info(f"Stage 1b resolved {len(stage_1b_success)} device(s)")
 
         # Stage 3-4: Submit to Ragscallion
         stage_2_done = [
@@ -466,13 +663,15 @@ async def run_pipeline(
             queue_3_nodes = manifest.list_by_queue(QUEUE_3_READY_FOR_EXTRACTION)
             queue_2_nodes = manifest.list_by_queue(QUEUE_2_POLLING_RAGSCALLION)
 
+            # Stage 6-7: Generate and validate PatchLang for any nodes
+            # that completed Stage 5 but haven't run Stage 6 yet.
+            # Run this BEFORE Stage 5 so patches are generated promptly
+            # without waiting for all extractions to finish.
+            await _run_stage_67_batch(manifest)
+
             if queue_3_nodes:
                 # Stage 5: Extract specs
                 await _run_stage_5_batch(manifest, ragscallion_client)
-
-            # Stage 6-7: Generate and validate PatchLang for any nodes
-            # that completed Stage 5 but haven't run Stage 6 yet.
-            await _run_stage_67_batch(manifest)
 
             if _is_pipeline_done(manifest):
                 logger.info("Pipeline complete — no nodes remain in active queues")

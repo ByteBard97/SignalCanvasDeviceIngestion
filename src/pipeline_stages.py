@@ -50,13 +50,13 @@ STAGE_COMPLETED = 2
 STAGE_FAILED = 3
 
 # Concurrency control
-EXTRACTION_SEMAPHORE = asyncio.Semaphore(5)  # Max 5 concurrent Haiku calls
+EXTRACTION_SEMAPHORE = asyncio.Semaphore(3)  # Max 3 concurrent — prevents heartbeat death
 FIND_PDF_SEMAPHORE = asyncio.Semaphore(3)    # Max 3 concurrent Stage 1 calls
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)    # Max 5 concurrent Stage 2 calls
 
 # Concurrency constants (no magic numbers)
-MAX_CONCURRENT_EXTRACTIONS = 5
-EXTRACTION_TIMEOUT_SECONDS = 360  # Consoles (e.g. CL5, SQ-5) need extra search time
+MAX_CONCURRENT_EXTRACTIONS = 3
+EXTRACTION_TIMEOUT_SECONDS = 600  # Complex devices (matrix switchers, consoles) need extra time
 FIND_PDF_TIMEOUT_SECONDS = 120
 FIND_PDF_MAX_STEPS = 5  # tight budget; force fail-fast instead of broad exploration
 FIND_PDF_RETRY_ATTEMPTS = 2  # retry on empty Kimi output or model-mismatch URL
@@ -179,6 +179,71 @@ def _av_iq_url_for_device(manufacturer: str, model: str) -> Optional[str]:
     return None
 
 
+# Domains known to serve fake / stub / non-PDF content masquerading as datasheets.
+_BLOCKED_PDF_DOMAINS: set[str] = {
+    "router-switch.com",
+    "www.router-switch.com",
+    "manuals.plus",           # Serves generic/manual placeholder pages
+    "www.manuals.plus",
+    "gearmashers.com",        # SEO aggregator, not manufacturer docs
+    "www.gearmashers.com",
+}
+
+# Generic filenames that signal a non-device-specific (aggregator) PDF.
+_GENERIC_PDF_FILENAMES: set[str] = {
+    "speaker.pdf",
+    "product.pdf",
+    "datasheet.pdf",
+    "manual.pdf",
+    "brochure.pdf",
+    "spec.pdf",
+    "specs.pdf",
+}
+
+
+def _is_blocked_domain(url: str) -> bool:
+    """Return True if *url* is on the known-bad domain blocklist."""
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+        return host in _BLOCKED_PDF_DOMAINS
+    except Exception:
+        return False
+
+
+def _is_generic_av_iq_url(url: str, manufacturer: str, model: str) -> bool:
+    """Return True if an AV-iQ URL looks like a generic catch-all, not device-specific.
+
+    AV-iQ sometimes indexes placeholder pages (e.g. ``Speaker.pdf``) that match
+    fuzzy heuristics but don't actually describe the requested device.
+    """
+    path = urllib.parse.urlparse(url).path.lower()
+    filename = path.split("/")[-1]
+
+    # Reject known generic filenames
+    if filename in _GENERIC_PDF_FILENAMES:
+        return True
+
+    # Build a set of tokens to look for in the URL path
+    tokens: set[str] = set()
+    for part in manufacturer.lower().split():
+        if len(part) >= 2:
+            tokens.add(part)
+    for part in model.lower().replace("/", " ").replace("-", " ").split():
+        if len(part) >= 2:
+            tokens.add(part)
+            # Also add numeric-only substrings for model numbers like "18C"
+            if any(c.isdigit() for c in part):
+                tokens.add(part)
+
+    # URL must contain at least one recognizable token
+    for token in tokens:
+        if token in path:
+            return False
+
+    # No token matched → URL is likely generic
+    return True
+
+
 async def _search_duckduckgo_for_pdf(
     manufacturer: str,
     model: str,
@@ -258,6 +323,219 @@ async def _search_duckduckgo_for_pdf(
         return url
 
     return None
+
+
+async def _search_duckduckgo_web(
+    manufacturer: str,
+    model: str,
+) -> list[dict]:
+    """General web search via DuckDuckGo HTML endpoint.
+
+    Returns a list of result dicts with keys: title, snippet, url.
+    """
+    import httpx
+
+    query = f'"{manufacturer}" "{model}"'
+    search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(search_url, headers=headers)
+            resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"DDG web search failed for {manufacturer} {model}: {e}")
+        return []
+
+    results: list[dict] = []
+
+    # DuckDuckGo result titles are in <a class="result__a"> tags
+    # Snippets are in <a class="result__snippet"> tags
+    title_links = re.findall(
+        r'<a[^>]+class="result__a"[^>]*>(.*?)</a>',
+        resp.text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    snippet_links = re.findall(
+        r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+        resp.text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # URLs are in the redirect links
+    redirect_links = re.findall(
+        r'//duckduckgo\.com/l/\?uddg=([^&"\s]+)',
+        resp.text,
+    )
+
+    for i, title in enumerate(title_links[:5]):
+        # Strip HTML tags from title
+        clean_title = re.sub(r'<[^>]+>', '', title)
+        snippet = snippet_links[i] if i < len(snippet_links) else ""
+        clean_snippet = re.sub(r'<[^>]+>', '', snippet)
+        url = ""
+        if i < len(redirect_links):
+            try:
+                url = urllib.parse.unquote(redirect_links[i])
+            except Exception:
+                pass
+        results.append({
+            "title": clean_title.strip(),
+            "snippet": clean_snippet.strip(),
+            "url": url,
+        })
+
+    return results
+
+
+async def _attempt_name_correction(
+    node: DeviceNode,
+    manifest: Manifest,
+    rejected_urls: list[str],
+) -> bool:
+    """Detect and correct swapped/wrong manufacturer/model, then retry PDF search.
+
+    Uses a web search + LLM to determine if the upstream patchify data has
+    manufacturer and model backwards, typos, or is completely wrong. If a
+    correction is found, updates the node and re-runs Stage 1 with the new name.
+
+    Returns True if a PDF was found after correction.
+    """
+    from .kimi_runner import run_kimi, extract_json_block
+
+    # Only attempt correction for devices that look suspicious or already failed
+    # PDF search. Skip obviously-good names.
+    original_mfg = node.manufacturer.strip()
+    original_model = node.model.strip()
+
+    # Heuristic: skip if both look like real pro-audio names.
+    # Well-known manufacturers that should NEVER appear in the model field.
+    _WELL_KNOWN_MFGS = {
+        "sony", "shure", "sennheiser", "audio-technica", "akg", "beyerdynamic",
+        "neumann", "rode", "dbx", "qsc", "yamaha", "mackie", "behringer",
+        "allen & heath", "allen_heath", "allen-heath", "avid", "presonus",
+        "focusrite", "universal audio", "apogee", "rme", "motu", "tascam",
+        "zoom", "blackmagic design", "blackmagic", "panasonic", "canon",
+        "jbl", "bose", "ev", "electro-voice", "rcf", "nexo", "d&b",
+        "dbaudiotechnik", "l-acoustics", "martin audio", "meyer sound",
+        "barco", "christie", "epson", "panasonic", "sony", "nec", "lg",
+        "samsung", "extron", "kramer", "crestron", "amx", "biamp",
+        "audinate", "dante", "cisco", "netgear", "ubiquiti", "meraki",
+        "aruba", "dell", "hp", "lenovo", "apple",
+    }
+    model_words = set(original_model.lower().split())
+    mfg_is_well_known = original_mfg.lower() in _WELL_KNOWN_MFGS
+    model_contains_well_known_mfg = bool(model_words & _WELL_KNOWN_MFGS)
+
+    looks_suspicious = (
+        original_mfg.lower() in {"generic", "unknown", ""}
+        or len(original_model) <= 2
+        or original_mfg.lower() in original_model.lower()
+        or original_model.lower() in original_mfg.lower()
+        or model_contains_well_known_mfg  # e.g. model="Sony" when mfg="Lav K33 RX"
+    )
+    if not looks_suspicious:
+        return False
+
+    logger.info(
+        f"Device {node.device_id}: attempting name correction for "
+        f"'{original_mfg} {original_model}'"
+    )
+
+    # Step 1: do a general web search
+    search_results = await _search_duckduckgo_web(original_mfg, original_model)
+    if not search_results:
+        return False
+
+    # Step 2: ask Kimi to analyze the search results
+    results_text = "\n".join(
+        f"{i+1}. {r['title']}\n   {r['snippet']}\n   {r['url']}"
+        for i, r in enumerate(search_results[:5])
+    )
+
+    prompt = (
+        f'A device is listed as "{original_mfg} {original_model}". '
+        f'Here are the top web search results for this name:\n\n'
+        f'{results_text}\n\n'
+        f'Analyze these results. Is "{original_mfg} {original_model}" a real '
+        f'professional audio/video device (mixer, speaker, camera, converter, etc.)? '
+        f'If the manufacturer and model appear to be swapped, misspelled, or wrong, '
+        f'reply with ONLY this JSON line:\n'
+        f'  {{"manufacturer":"<correct manufacturer>","model":"<correct model>"}}\n'
+        f'If the name is already correct and it is a real AV device, reply:\n'
+        f'  {{"manufacturer":null,"model":null}}\n'
+        f'No commentary.'
+    )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    skills_dir = repo_root / ".claude" / "skills"
+
+    try:
+        stdout = await run_kimi(
+            prompt,
+            skills_dir=skills_dir,
+            work_dir=repo_root,
+            timeout=60,
+            max_steps=5,
+        )
+    except Exception as e:
+        logger.warning(f"Device {node.device_id} name correction Kimi failed: {e}")
+        return False
+
+    if not stdout:
+        return False
+
+    json_block = extract_json_block(stdout)
+    if not json_block:
+        return False
+
+    try:
+        data = json.loads(json_block)
+    except json.JSONDecodeError:
+        return False
+
+    corrected_mfg = data.get("manufacturer")
+    corrected_model = data.get("model")
+
+    if not corrected_mfg or not corrected_model:
+        logger.info(f"Device {node.device_id}: name correction found no better name")
+        return False
+
+    corrected_mfg = corrected_mfg.strip()
+    corrected_model = corrected_model.strip()
+
+    # Don't retry if the "correction" is essentially the same
+    if (
+        corrected_mfg.lower() == original_mfg.lower()
+        and corrected_model.lower() == original_model.lower()
+    ):
+        return False
+
+    logger.info(
+        f"Device {node.device_id}: name corrected from "
+        f"'{original_mfg} {original_model}' -> '{corrected_mfg} {corrected_model}'"
+    )
+
+    # Update node with corrected name
+    node.manufacturer = corrected_mfg
+    node.model = corrected_model
+    # Also update device_id to reflect the corrected name
+    new_device_id = f"{corrected_mfg.lower().replace(' ', '-').replace('_', '-')}-{corrected_model.lower().replace(' ', '-').replace('/', '-').replace('_', '-')}"
+    new_device_id = "-".join(filter(None, new_device_id.split("-")))[:64]
+    if new_device_id != node.device_id:
+        logger.info(f"Device {node.device_id}: renamed to {new_device_id}")
+        # We can't easily rename the device_id in the manifest because it's the PK.
+        # Instead, just update the manufacturer/model and keep the old device_id.
+        # The corpus_id should also be updated for Ragscallion compatibility.
+        import re
+        node.corpus_id = re.sub(r"[^a-z0-9_-]", "_", new_device_id.lower())[:64]
+        if node.corpus_id and not re.match(r"^[a-z0-9]", node.corpus_id):
+            node.corpus_id = "d" + node.corpus_id[:63]
+
+    manifest.persist(node)
+
+    # Retry PDF search with corrected name (disable further correction to
+    # prevent infinite recursion).
+    return await _find_spec_sheet_url(node, manifest, _allow_correction=False)
 
 
 def _build_fallback_url_prompt(
@@ -457,6 +735,7 @@ async def stage_1_find_pdf(
 async def _find_spec_sheet_url(
     node: DeviceNode,
     manifest: Manifest,
+    _allow_correction: bool = True,
 ) -> bool:
     """Find canonical manufacturer datasheet PDF URL via Kimi CLI.
 
@@ -482,23 +761,36 @@ async def _find_spec_sheet_url(
         # know the PDF URL.
         av_iq_url = _av_iq_url_for_device(node.manufacturer, node.model)
         if av_iq_url:
-            logger.info(
-                f"Device {node.device_id}: AV-iQ match found, skipping agentic search"
-            )
-            node.pdf_url = av_iq_url
-            node.stage_find_pdf = STAGE_COMPLETED
-            manifest.add_document(
-                node.device_id, DOC_TYPE_SPEC_SHEET, url=av_iq_url
-            )
-            manifest.persist(node)
-            return True
+            if _is_generic_av_iq_url(av_iq_url, node.manufacturer, node.model):
+                logger.warning(
+                    f"Device {node.device_id}: AV-iQ URL rejected as generic: {av_iq_url}"
+                )
+            elif _is_blocked_domain(av_iq_url):
+                logger.warning(
+                    f"Device {node.device_id}: AV-iQ URL rejected (blocked domain): {av_iq_url}"
+                )
+            else:
+                logger.info(
+                    f"Device {node.device_id}: AV-iQ match found, skipping agentic search"
+                )
+                node.pdf_url = av_iq_url
+                node.stage_find_pdf = STAGE_COMPLETED
+                manifest.add_document(
+                    node.device_id, DOC_TYPE_SPEC_SHEET, url=av_iq_url
+                )
+                manifest.persist(node)
+                return True
+
+        # Also blocklist-check any URL the agent finds later
+        rejected_urls: list[str] = []
+        if _is_blocked_domain(node.pdf_url or ""):
+            rejected_urls.append(node.pdf_url or "")
 
         from .kimi_runner import run_kimi, extract_json_block
 
         repo_root = Path(__file__).resolve().parent.parent
         skills_dir = repo_root / ".claude" / "skills"
 
-        rejected_urls: list[str] = []
         last_failure_message = "Kimi CLI returned no output or failed"
         sku_for_search = _resolved_sku(node)
 
@@ -539,6 +831,11 @@ async def _find_spec_sheet_url(
                 continue
 
             pdf_url = pdf_url.strip()
+            if _is_blocked_domain(pdf_url):
+                last_failure_message = f"URL rejected (blocked domain): {pdf_url}"
+                rejected_urls.append(pdf_url)
+                continue
+
             if not pdf_url.lower().endswith(".pdf"):
                 is_pdf = await _verify_pdf_content_type(pdf_url)
                 if not is_pdf:
@@ -574,12 +871,173 @@ async def _find_spec_sheet_url(
             logger.info(f"Device {node.device_id} PDF URL found via DDG fallback: {ddg_url}")
             return True
 
+        # Before giving up, try to detect and correct bad manufacturer/model data.
+        # This handles cases like swapped manufacturer/model or typos in the
+        # upstream patchify database.
+        if _allow_correction:
+            corrected = await _attempt_name_correction(node, manifest, rejected_urls)
+            if corrected:
+                return True
+
         _set_stage_failure(
             node,
             manifest,
             stage=STAGE_FIND_PDF,
             category=FailureCategory.PDF_NOT_FOUND,
             message=f"All {FIND_PDF_RETRY_ATTEMPTS} attempts failed. Last: {last_failure_message}",
+            retryable=True,
+        )
+        return False
+
+
+def _build_find_html_prompt(manufacturer: str, model: str, exclude_urls: list[str]) -> str:
+    """Build the Stage 1b Kimi prompt — find an HTML product page when PDF is not available."""
+    base = (
+        f'Web search for the official manufacturer product page or spec page URL '
+        f'of "{manufacturer} {model}". '
+        f'Do ONE web search, pick the best result that is an HTML page (NOT a PDF), '
+        f'and reply with ONLY this JSON line: {{"html_url":"<url>"}}. '
+        f'Prefer pages that contain technical specifications (I/O, connectors, signal flow). '
+        f'If no HTML page URL is in the search results, reply: {{"html_url":null}}. '
+        f'No commentary.'
+    )
+    if exclude_urls:
+        base += (
+            f' The following URLs were already rejected as wrong-device or unreachable; '
+            f'do NOT return them: {json.dumps(exclude_urls)}.'
+        )
+    return base
+
+
+FIND_HTML_SEMAPHORE = asyncio.Semaphore(3)
+FIND_HTML_TIMEOUT_SECONDS = 120
+FIND_HTML_RETRY_ATTEMPTS = 2
+
+
+async def stage_1b_find_html_source(
+    node: DeviceNode,
+    manifest: Manifest,
+    cache_dir: Path,
+) -> bool:
+    """Stage 1b: When PDF search fails, try to find an HTML product page.
+
+    Uses Kimi to find an HTML spec page, then fetches and prepares the source:
+    - Static/simple pages: extracted as Markdown (.md) via trafilatura
+    - JS-heavy pages: rendered to PDF via Playwright, then ingested via Marker
+
+    On success, marks Stage 1 and Stage 2 as completed and moves node to
+    QUEUE_2_POLLING_RAGSCALLION (bypassing download since source is local).
+
+    Input:
+        node: Device node that failed Stage 1 (PDF_NOT_FOUND).
+        cache_dir: Directory to cache downloaded/rendered source files.
+
+    Output:
+        True if a source file was produced and node advanced to queue_2.
+        False if failure metadata set (HTML_SOURCE_NOT_FOUND).
+    """
+    async with FIND_HTML_SEMAPHORE:
+        from .kimi_runner import run_kimi, extract_json_block
+        from .stages.fetch_html_source import fetch_and_prepare_source
+
+        repo_root = Path(__file__).resolve().parent.parent
+        skills_dir = repo_root / ".claude" / "skills"
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        rejected_urls: list[str] = []
+        last_failure_message = "Kimi CLI returned no output or failed"
+        sku_for_search = _resolved_sku(node)
+
+        for attempt in range(1, FIND_HTML_RETRY_ATTEMPTS + 1):
+            prompt = _build_find_html_prompt(node.manufacturer, sku_for_search, rejected_urls)
+
+            try:
+                stdout = await run_kimi(
+                    prompt,
+                    skills_dir=skills_dir,
+                    work_dir=repo_root,
+                    timeout=FIND_HTML_TIMEOUT_SECONDS,
+                    max_steps=FIND_PDF_MAX_STEPS,
+                )
+            except Exception as e:
+                logger.error(f"Device {node.device_id} HTML search Kimi failed (attempt {attempt}): {e}")
+                stdout = None
+
+            if not stdout:
+                last_failure_message = f"Kimi CLI returned no output (attempt {attempt})"
+                logger.warning(f"Device {node.device_id} Stage 1b attempt {attempt}: empty output")
+                continue
+
+            json_block = extract_json_block(stdout)
+            if not json_block:
+                last_failure_message = f"Kimi returned unparseable output: {stdout[:500]}"
+                continue
+
+            try:
+                data = json.loads(json_block)
+            except json.JSONDecodeError as e:
+                last_failure_message = f"JSON parse error: {e}. Raw: {json_block[:500]}"
+                continue
+
+            html_url = data.get("html_url") if isinstance(data, dict) else None
+            if not html_url or not isinstance(html_url, str):
+                last_failure_message = f"Kimi JSON missing 'html_url' field. Raw: {json_block[:500]}"
+                continue
+
+            html_url = html_url.strip()
+            if html_url.lower().endswith(".pdf"):
+                last_failure_message = f"URL is a PDF, not HTML: {html_url}"
+                rejected_urls.append(html_url)
+                continue
+
+            # Try to fetch and prepare the source
+            logger.info(f"Device {node.device_id}: fetching HTML source from {html_url}")
+            try:
+                source_path = await fetch_and_prepare_source(
+                    html_url=html_url,
+                    device_id=node.device_id,
+                    cache_dir=cache_dir,
+                )
+            except Exception as e:
+                logger.warning(f"Device {node.device_id}: fetch_and_prepare_source failed: {e}")
+                last_failure_message = f"Source fetch failed: {e}"
+                rejected_urls.append(html_url)
+                continue
+
+            if source_path is None:
+                last_failure_message = f"Source fetch returned nothing for {html_url}"
+                rejected_urls.append(html_url)
+                continue
+
+            # Success! Record the source and advance the node.
+            node.pdf_path = str(source_path)  # Field name is a misnomer; it holds the source file
+            node.stage_find_pdf = STAGE_COMPLETED
+            node.stage_download_pdf = STAGE_COMPLETED  # Skip download — source is already local
+            node.queue = QUEUE_2_POLLING_RAGSCALLION
+
+            # Record as a document
+            manifest.add_document(
+                node.device_id,
+                DOC_TYPE_SPEC_SHEET,
+                url=html_url,
+                local_path=str(source_path),
+            )
+            manifest.persist(node)
+
+            source_type = "Markdown" if source_path.suffix == ".md" else source_path.suffix
+            logger.info(
+                f"Device {node.device_id}: HTML source resolved ({source_type}) "
+                f"from {html_url} -> {source_path}"
+            )
+            return True
+
+        _set_stage_failure(
+            node,
+            manifest,
+            stage=8,  # STAGE_FIND_HTML — not in canonical list, handled gracefully
+            category=FailureCategory.HTML_SOURCE_NOT_FOUND,
+            message=f"All {FIND_HTML_RETRY_ATTEMPTS} HTML search attempts failed. Last: {last_failure_message}",
             retryable=True,
         )
         return False
@@ -879,9 +1337,15 @@ async def stage_2_download_pdf(
                             f"Device {node.device_id} SSL verify failed for {url}, "
                             f"retrying with verify=False"
                         )
-                        r = await client.get(url, headers=headers, verify=False)
-                        r.raise_for_status()
-                        return r.content
+                        # httpx does not accept verify= on get(); create a new client
+                        async with httpx.AsyncClient(
+                            follow_redirects=True,
+                            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                            verify=False,
+                        ) as ssl_client:
+                            r = await ssl_client.get(url, headers=headers)
+                            r.raise_for_status()
+                            return r.content
                     raise
 
         for attempt in range(1 + DOWNLOAD_FALLBACK_ATTEMPTS):
@@ -1544,7 +2008,9 @@ async def process_stage_5_batch(
     # Also retry queue_4 nodes that failed extraction but are retryable
     retry_nodes = [
         n for n in manifest.list_by_queue(QUEUE_4_MANUAL_REVIEW)
-        if n.stage_extract_specs == STAGE_FAILED and n.failure_retryable
+        if n.stage_extract_specs == STAGE_FAILED
+        and n.failure_retryable
+        and not n.specs_json  # Skip if we already have specs from a prior success
     ]
     nodes = list({n.device_id: n for n in nodes + retry_nodes}.values())
 
