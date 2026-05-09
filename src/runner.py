@@ -259,9 +259,30 @@ def _run_patchify_fast_path(
     fast_nodes: list[DeviceNode] = []
 
     for node in nodes:
-        # Safety guard: never touch nodes that already have pipeline progress.
-        # This protects PDF-extracted devices from being overwritten on re-runs.
-        if node.stage_find_pdf != STAGE_NOT_STARTED or node.specs_json:
+        # SAFETY GUARD — comprehensive check for any prior pipeline state.
+        # A node is ONLY eligible for fast-pathing if it has never done any
+        # pipeline work AND has no artifacts. Any hint of prior progress
+        # (even failures, in-progress stages, or empty specs_json) means we
+        # must skip it to avoid data loss.
+        has_any_progress = (
+            node.stage_resolve_sku != STAGE_NOT_STARTED
+            or node.stage_find_pdf != STAGE_NOT_STARTED
+            or node.stage_download_pdf != STAGE_NOT_STARTED
+            or node.stage_convert_marker != STAGE_NOT_STARTED
+            or node.stage_index_rag != STAGE_NOT_STARTED
+            or node.stage_extract_specs != STAGE_NOT_STARTED
+            or node.stage_generate_patch != STAGE_NOT_STARTED
+            or node.stage_validate_patch != STAGE_NOT_STARTED
+            or bool(node.specs_json)          # None or ""
+            or bool(node.pdf_url)
+            or bool(node.pdf_path)
+            or bool(node.ragscallion_job_id)
+            or bool(node.patch_source)
+            or node.failure_stage is not None
+            or node.marked_suspicious
+            or bool(manifest.list_documents(node.device_id))
+        )
+        if has_any_progress:
             continue
 
         specs = extract_specs_from_patchify(node.device_id)

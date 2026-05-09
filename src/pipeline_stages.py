@@ -1848,6 +1848,7 @@ async def stage_5_extract_specs(
                 model=node.model,
                 corpus_id=node.corpus_id,
                 rag_search=lambda q: ragscallion_client.search(q, corpus=node.corpus_id),
+                device_id=node.device_id,
             )
 
             if not spec_json:
@@ -1907,6 +1908,7 @@ async def _extract_specs_via_agent(
     model: str,
     corpus_id: str,
     rag_search,
+    device_id: str = "",
 ) -> Optional[str]:
     """Extract device specs via Kimi CLI using RAG context.
 
@@ -1919,16 +1921,23 @@ async def _extract_specs_via_agent(
         model: Device model (e.g., "R08D")
         corpus_id: Ragscallion corpus ID for this device
         rag_search: Callable that searches Ragscallion corpus for context
+        device_id: Optional device ID for looking up combined context
 
     Returns:
         JSON string of extracted specs, or None if extraction failed.
     """
     from .kimi_runner import run_kimi, extract_json_block
+    from .stages.combined_device_context import get_context_as_prompt_text
 
     repo_root = Path(__file__).resolve().parent.parent
     skills_dir = repo_root / ".claude" / "skills"
 
     ragscallion_base_url = "http://192.168.0.200:8086"
+
+    # Fetch combined context from patchify + EasySchematic
+    combined_context = ""
+    if device_id:
+        combined_context = get_context_as_prompt_text(device_id, manufacturer, model)
 
     prompt = (
         f"You are the SignalCanvas device-extraction agent.\n"
@@ -1939,6 +1948,22 @@ async def _extract_specs_via_agent(
         f"- model: {model}\n"
         f"- corpus_id: {corpus_id}\n"
         f"- ragscallion_base_url: {ragscallion_base_url}\n"
+    )
+
+    if combined_context:
+        prompt += (
+            f"\n"
+            f"{combined_context}\n"
+            f"\n"
+            f"IMPORTANT: The context above is a STARTING POINT from community data.\n"
+            f"It may be WRONG, OUTDATED, or INCOMPLETE. Your job is to:\n"
+            f"1. VERIFY the port list against the Ragscallion corpus (datasheet chunks).\n"
+            f"2. CORRECT any errors in the known ports.\n"
+            f"3. DISCOVER bridge/routing information that the context explicitly says is missing.\n"
+            f"4. Use the reference URL (if provided) as a starting point for verification.\n"
+        )
+
+    prompt += (
         f"\n"
         f"Task:\n"
         f"1. Query the Ragscallion corpus with targeted curl searches.\n"
