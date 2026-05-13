@@ -1,0 +1,19 @@
+{
+  "Extron": {
+    "pdf_url_pattern": "https://media.extron.com/public/download/files/specs/<product_slug>.pdf",
+    "search_hint": "site:media.extron.com/public/download/files/specs filetype:pdf",
+    "notes": "Extron catalog numbers (60-XXXX-XX) don't resolve via general search. PDFs are at media.extron.com/public/download/files/specs/. Product slug is usually the model name lowercase with underscores.",
+    "examples": [
+      "https://media.extron.com/public/download/files/specs/nav_10e_501_5815-D9.pdf",
+      "https://media.extron.com/public/download/files/specs/fox3_sr_321_331_6337-D2.pdf"
+    ]
+  },
+  "Crestron": {
+    "pdf_url_pattern": "https://www.crestron.com/getmedia/<hash>/<filename>",
+    "search_hint": "site:crestron.com filetype:pdf OR site:crestron.com/getmedia",
+    "notes": "Crestron PDFs served from getmedia CDN — not indexed by search engines. Requires direct URL from product page.",
+    "examples": [
+      "https://www.crestron.com/getmedia/0c3fa16d-7ab1-4f0a-8b53-8a08220ab118/ss_CCC-BYOD-KIT"
+    ]
+  }
+}

@@ -77,6 +77,10 @@ RULE_TABLE: list[tuple[str, str, str]] = [
     (r"HP", r".*G\d+.*|.*Poly.*|.*Engage.*|.*Presence.*|.*Studio.*", "codec"),
     # Dante stageboxes
     (r"Yamaha", r"Rio.*", "dante_stagebox"),
+    # Yamaha MY expansion cards — ADAT/AES/analog cards for Yamaha consoles, not Dante
+    (r"Yamaha", r"MY.*", "generic"),
+    # Meyer Sound passive/powered speakers and subwoofers — not DSPs
+    (r"Meyer\s*Sound", r".*", "speaker"),
     # Dante input adapters (analog → Dante)
     (r"Audinate", r"AVIO-AI.*", "dante_adapter_input"),
     # Dante output adapters (Dante → analog)
@@ -109,6 +113,8 @@ RULE_TABLE: list[tuple[str, str, str]] = [
     (r"EVS", r"CGP.*|XS.*|XT.*|IPD.*", "generic"),
     # Allen & Heath expansion cards — M-AIN is analogue, M-DL-AES* is AES3
     # Only M-DL-DANTE* cards are actual Dante cards
+    # DX expanders use dSNAKE protocol, not Dante
+    (r"Allen.*Heath", r"DX.*", "generic"),
     (r"Allen.*Heath", r"M-AIN.*|M-DL-AES.*|M-DL-ACE.*|M-DL-MADI.*", "generic"),
     (r"Allen.*Heath", r"M-DL-DANTE.*|M-DL-WAVES.*", "dante_adapter_input"),
     # Yamaha wireless USB receivers — USB dongle, not Dante
