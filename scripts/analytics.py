@@ -315,6 +315,20 @@ def _report(conn: sqlite3.Connection) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _update_processed_file(conn: sqlite3.Connection) -> None:
+    """Regenerate output/processed_devices.txt from the analytics DB.
+
+    Called after every update so select_batch scripts always have a fresh
+    exclusion list and never re-select already-attempted devices.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT device_id FROM device_outcomes")
+    ids = sorted(row[0] for row in cur.fetchall())
+    out = ANALYTICS_DB.parent / "processed_devices.txt"
+    out.write_text("\n".join(ids) + "\n")
+    print(f"Updated {out} ({len(ids)} device IDs)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aggregate ingestion analytics")
     parser.add_argument("--report", action="store_true", help="Print pattern report after update")
@@ -336,6 +350,9 @@ def main() -> None:
             print(f"  {m.parent.name:<40} {n:>4} devices")
             total += n
         print(f"\nTotal rows upserted: {total}")
+
+    if not args.report_only:
+        _update_processed_file(conn)
 
     if args.report or args.report_only:
         _report(conn)
