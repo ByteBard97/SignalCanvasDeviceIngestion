@@ -222,6 +222,7 @@ def _process_job_result(job: dict, node, manifest: Manifest) -> None:
         error_msg = job.get("error", "Unknown error")
         if is_spec_sheet:
             node.queue = 4
+            node.stage_index_rag = 3  # STAGE_FAILED — must be set so retry filters can find it
             manifest.persist(node)
             manifest.add_failure(
                 device_id=corpus_id,
