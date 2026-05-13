@@ -460,6 +460,7 @@ class Manifest:
             node.failure_retryable, node.failure_attempts, node.failure_at,
             node.queue, node.created_at, node.updated_at,
             node.stage_resolve_sku, node.canonical_sku, node.canonical_product_name,
+            node.device_class,
         )
 
     def _row_to_node(self, row: tuple) -> DeviceNode:
@@ -477,6 +478,7 @@ class Manifest:
             "failure_retryable", "failure_attempts", "failure_at",
             "queue", "created_at", "updated_at",
             "stage_resolve_sku", "canonical_sku", "canonical_product_name",
+            "device_class",
         ]
         data = dict(zip(keys, row))
         # Convert SQLite booleans (0/1) to Python booleans
@@ -489,7 +491,7 @@ class Manifest:
         conn.execute("""
             INSERT OR REPLACE INTO device_nodes VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
         """, self._node_to_row(node))
 
