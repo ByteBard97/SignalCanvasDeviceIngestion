@@ -9,7 +9,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-RAGSCALLION_SEARCH_URL = "http://192.168.0.200:8086/search"
+RAGSCALLION_SEARCH_URL = "http://localhost:8086/search"
 DEFAULT_SEARCH_LIMIT = 3
 DEFAULT_SEARCH_TIMEOUT = 30.0
 

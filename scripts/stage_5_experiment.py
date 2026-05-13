@@ -66,7 +66,7 @@ MAX_CONCURRENT_CALLS = 3
 PER_DEVICE_TIMEOUT_SECONDS = 120
 
 # Ragscallion search endpoint
-RAGSCALLION_SEARCH_URL = "http://192.168.0.200:8086/search"
+RAGSCALLION_SEARCH_URL = "http://localhost:8086/search"
 
 # Fixed search queries (deterministic so runs are comparable)
 SEARCH_QUERIES = [

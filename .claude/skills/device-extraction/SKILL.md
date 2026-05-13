@@ -41,7 +41,7 @@ SignalCanvasDeviceIngestion harness and must emit **only** valid JSON on stdout.
    - `manufacturer` — e.g. `"YAMAHA"`
    - `model` — e.g. `"R08D"`
    - `corpus_id` — e.g. `"yamaha-phase0"`
-   - `ragscallion_base_url` — e.g. `"http://192.168.0.200:8086"`
+   - `ragscallion_base_url` — e.g. `"http://localhost:8086"`
 
 2. **Query the corpus with targeted searches.** Use `curl` to hit:
    ```

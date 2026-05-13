@@ -162,7 +162,7 @@ for db in output/*.db; do echo "=== $db ==="; sqlite3 "$db" "SELECT device_id, L
 for f in output/batch_20_v4_patches/*.patch; do if grep -q '\[1\.\.[0-9]*\]' "$f"; then echo "$f:"; grep '\[1\.\.[0-9]*\]' "$f"; fi; done
 
 # Ragscallion health
-curl -s http://192.168.0.200:8086/health
+curl -s http://localhost:8086/health
 ```
 
 ---

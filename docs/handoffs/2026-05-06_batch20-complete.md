@@ -9,7 +9,7 @@
 ## TL;DR
 
 - **Batch 20 is DONE**: 17/20 AV devices have clean, valid PatchLang patches. 3 networking devices correctly marked OUT_OF_SCOPE.
-- **Ragscallion now supports HTML/Markdown** (deployed to Linux box `192.168.0.200:8086`).
+- **Ragscallion now supports HTML/Markdown** (deployed to Linux box `localhost:8086`).
 - **Pipeline has HTML fallback**: When PDF not found, searches for HTML spec page → trafilatura extract OR Playwright PDF render.
 - **Next task**: Pick 40 random unprocessed pro-AV devices from the candidate pool, run through pipeline, vigilently observe.
 
@@ -112,10 +112,10 @@ cd /Users/ceres/Desktop/SignalCanvas/SignalCanvasDeviceIngestion
 ## 4. Key Infrastructure
 
 ### Ragscallion Server (Linux box)
-- **Host:** `192.168.0.200:8086`
+- **Host:** `localhost:8086`
 - **Path on Linux:** `~/projects/device-library-rag/`
 - **Start:** `cd ~/projects/device-library-rag && nohup .venv/bin/python server.py 8086 > server.log 2>&1 &`
-- **Health:** `curl http://192.168.0.200:8086/health`
+- **Health:** `curl http://localhost:8086/health`
 - **Supported formats:** `.pdf`, `.md`, `.txt`, `.html`, `.htm`
 - **PDF path:** Uses Marker (GPU-heavy, serialized via `MARKER_LOCK`)
 - **Non-PDF path:** Uses `trafilatura` for HTML→Markdown extraction, then chunk→embed→index
@@ -132,7 +132,7 @@ cd /Users/ceres/Desktop/SignalCanvas/SignalCanvasDeviceIngestion
 **Deploy to Linux:**
 ```bash
 scp /Users/ceres/Desktop/SignalCanvas/ragscallion/{server.py,ingest.py,pyproject.toml} \
-  192.168.0.200:~/projects/device-library-rag/
+  localhost:~/projects/device-library-rag/
 # Then SSH to install deps and restart
 ```
 
@@ -246,19 +246,19 @@ python -m pytest tests/ -x -q
 python -m src.runner --devices devices.txt --cache-dir output/pdfs --manifest-db output/batch.db
 
 # Check Ragscallion health
-curl http://192.168.0.200:8086/health
+curl http://localhost:8086/health
 
 # Check Ragscallion stats
-curl http://192.168.0.200:8086/stats
+curl http://localhost:8086/stats
 
 # Check manifest
 python -m src.cli.manifest_admin --db output/batch.db status
 
 # SSH to Linux box
-ssh 192.168.0.200
+ssh localhost
 
 # Restart Ragscallion on Linux
-ssh 192.168.0.200 "cd ~/projects/device-library-rag && pkill -f 'server.py 8086'; sleep 2; nohup .venv/bin/python server.py 8086 > server.log 2>&1 &"
+ssh localhost "cd ~/projects/device-library-rag && pkill -f 'server.py 8086'; sleep 2; nohup .venv/bin/python server.py 8086 > server.log 2>&1 &"
 ```
 
 ---

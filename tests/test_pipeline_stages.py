@@ -53,7 +53,7 @@ def sample_device_node(tmp_path):
 @pytest.fixture
 def ragscallion_client():
     """Create a RagscallionClient instance."""
-    return RagscallionClient(base_url="http://192.168.0.200:8086")
+    return RagscallionClient(base_url="http://localhost:8086")
 
 
 class TestStage34SubmitToRagscallion:

@@ -110,7 +110,7 @@ manifest.persist()
 
 **API call:**
 ```bash
-curl -X POST http://192.168.0.200:8086/ingest \
+curl -X POST http://localhost:8086/ingest \
   -H "Content-Type: multipart/form-data" \
   -F "file=@/path/to/r08d.pdf" \
   -F "corpus_id=yamaha-r08d" \
@@ -153,7 +153,7 @@ async def poll_ragscallion_jobs():
             request_start = datetime.now()
             
             response = requests.get(
-                "http://192.168.0.200:8086/jobs",
+                "http://localhost:8086/jobs",
                 params={
                     "since": last_check.isoformat(),
                     "status": "ready,failed",
@@ -255,7 +255,7 @@ await asyncio.gather(*tasks)
 
 **Haiku agent now calls:**
 ```bash
-curl "http://192.168.0.200:8086/search?q=signal+routing&corpus=yamaha-r08d&n=5"
+curl "http://localhost:8086/search?q=signal+routing&corpus=yamaha-r08d&n=5"
 ```
 
 **Concurrency rationale:** I/O-bound calls, don't compete with GPU. At 5 concurrent Haiku calls, well under Anthropic API rate limits (4000 RPM for Haiku tier 1). Anthropic's rate limit headers will be binding constraint. If hitting 429s, reduce to 3.

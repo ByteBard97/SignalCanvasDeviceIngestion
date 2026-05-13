@@ -80,7 +80,7 @@ We ran a **40-device batch** through the full SignalCanvas ingestion pipeline us
 
 | Service | Status | Endpoint |
 |---------|--------|----------|
-| RAG (device-library-rag) | ✅ Running | `http://192.168.0.200:8086` |
+| RAG (device-library-rag) | ✅ Running | `http://localhost:8086` |
 | Patchify fast-path | ✅ Active | `src/stages/extract_patchify_ports.py` |
 | Combined context | ✅ Active | `src/stages/combined_device_context.py` |
 

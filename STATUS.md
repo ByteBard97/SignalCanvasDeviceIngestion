@@ -5,7 +5,7 @@
 ## ✅ Completed
 
 ### Infrastructure
-- [x] Ragscallion RAG server running on 192.168.0.200:8086 (resurrected)
+- [x] Ragscallion RAG server running on localhost:8086 (resurrected)
 - [x] SSH access to Linux box verified (your-username@localhost)
 - [x] Repository created and shared with Reid
 - [x] REQUIREMENTS.md — Complete 7-stage pipeline specification

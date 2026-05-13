@@ -47,8 +47,8 @@ Before running tests:
 # Install dependencies
 pip install -e ".[dev]"
 
-# Ensure Ragscallion server is running on 192.168.0.200:8086
-# Check health: curl http://192.168.0.200:8086/health
+# Ensure Ragscallion server is running on localhost:8086
+# Check health: curl http://localhost:8086/health
 ```
 
 ## Test Categories

@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-RAGSCALLION_SEARCH_URL = "http://192.168.0.200:8086/search"
+RAGSCALLION_SEARCH_URL = "http://localhost:8086/search"
 DEFAULT_PASS_LIMIT = 5
 DEFAULT_GENERIC_LIMIT = 3
 MAX_RETRIES = 1
