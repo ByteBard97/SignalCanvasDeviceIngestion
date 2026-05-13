@@ -262,6 +262,7 @@ async def _run_scope_check(nodes: list[DeviceNode], manifest: Manifest) -> list[
         classification = await classify(
             node.manufacturer, node.model, markdown_excerpt=excerpt or None
         )
+        node.device_class = classification.class_
         if classification.class_ == "it_networking":
             logger.info(
                 f"Device {node.device_id}: REJECTED — classified as {classification.class_} "
@@ -675,6 +676,7 @@ def _query_stage_1b_nodes(manifest: Manifest) -> list[DeviceNode]:
         )
         if n.failure_category in (
             FailureCategory.PDF_NOT_FOUND.value,
+            FailureCategory.PDF_INVALID.value,
             "HTML_SOURCE_NOT_FOUND",
         )
         and n.failure_retryable

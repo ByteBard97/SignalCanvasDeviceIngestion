@@ -46,7 +46,7 @@ class Classification:
 RULE_TABLE: list[tuple[str, str, str]] = [
     # Cisco AV codecs and cameras (in scope) — must come before IT rules
     # so the LLM never sees them and misclassifies based on brand bias
-    (r"Cisco", r"Codec.*|SX.*|MX.*|Room\s*Kit.*|Room\s*Bar.*|Room\s*Navigator.*|Webex.*|Precision.*|SpeakerTrack.*|TelePresence.*|P40.*|P60.*|Desk.*", "generic"),
+    (r"Cisco", r"Codec.*|CS-CPRO.*|CS-CODEC.*|SX.*|MX.*|Room\s*Kit.*|Room\s*Bar.*|Room\s*Navigator.*|Webex.*|Precision.*|SpeakerTrack.*|TelePresence.*|P40.*|P60.*|Desk.*", "codec"),
     # IT / Networking — explicitly out of scope for SignalCanvas
     (r"Cisco", r"SF.*|Catalyst.*|Nexus.*|ISR.*|ASA.*|Meraki.*|SG.*|CBS.*", "it_networking"),
     (r"Ubiquiti", r"USW.*|UDM.*|USG.*|EdgeRouter.*|EdgeSwitch.*|UAP.*", "it_networking"),
@@ -66,6 +66,15 @@ RULE_TABLE: list[tuple[str, str, str]] = [
     (r"WatchGuard", r".*", "it_networking"),
     (r"Extreme", r".*", "it_networking"),
     (r"Ruckus", r".*", "it_networking"),
+    # Intercom systems — must come before generic LLM fallback
+    (r"Green-GO", r".*", "intercom"),
+    (r"Clear-Com", r".*", "intercom"),
+    (r"RTS", r".*", "intercom"),
+    (r"Riedel", r".*Artist.*|.*Bolero.*|.*MediorNet.*|.*MicroN.*", "intercom"),
+    # HDBaseT extenders / AV-over-twisted-pair — no RF, no Dante, just passive AV transport
+    (r"Josawa|Lightware|Atlona|Kramer|Extron|Liberty\s*AV", r".*TPUK.*|.*HDBaseT.*|.*TP.*Rx.*|.*TP.*Tx.*|.*DTP.*", "generic"),
+    # HP Poly video conferencing — must come before the HP→it_networking catch-all
+    (r"HP", r".*G\d+.*|.*Poly.*|.*Engage.*|.*Presence.*|.*Studio.*", "codec"),
     # Dante stageboxes
     (r"Yamaha", r"Rio.*", "dante_stagebox"),
     # Dante input adapters (analog → Dante)

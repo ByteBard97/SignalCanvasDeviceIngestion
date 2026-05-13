@@ -1226,6 +1226,23 @@ _BROWSER_HEADERS = {
 }
 
 
+def _normalize_pdf_url(url: str) -> str:
+    """Rewrite known bad URL patterns to their downloadable equivalents.
+
+    GitHub blob pages return HTML, not PDFs. Transform to raw.githubusercontent.com.
+    Pattern: https://github.com/<user>/<repo>/blob/<branch>/<path>
+          → https://raw.githubusercontent.com/<user>/<repo>/<branch>/<path>
+    """
+    import re as _re
+    m = _re.match(
+        r"https?://github\.com/([^/]+/[^/]+)/blob/(.+)",
+        url,
+    )
+    if m:
+        return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}"
+    return url
+
+
 def _download_headers(url: str, manufacturer: str = "", model: str = "") -> dict[str, str]:
     """Return request headers that look like a real browser following a search result.
 
@@ -1312,7 +1329,10 @@ async def stage_2_download_pdf(
         pdf_path = cache_dir / f"{node.device_id}.pdf"
 
         tried_urls: list[str] = []
-        current_url = node.pdf_url
+        current_url = _normalize_pdf_url(node.pdf_url)
+        if current_url != node.pdf_url:
+            logger.info(f"Device {node.device_id}: URL rewritten {node.pdf_url} → {current_url}")
+            node.pdf_url = current_url
         last_error = "no attempts made"
 
         async def _try_download(url: str) -> bytes:

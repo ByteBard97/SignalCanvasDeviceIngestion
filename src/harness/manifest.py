@@ -134,6 +134,9 @@ class DeviceNode:
     canonical_sku: Optional[str] = None
     canonical_product_name: Optional[str] = None
 
+    # Device classification (set by classify_device at scope check; persisted for analytics)
+    device_class: Optional[str] = None
+
     # PDF artifacts
     pdf_url: Optional[str] = None
     pdf_path: Optional[str] = None
@@ -304,6 +307,7 @@ class Manifest:
                 ("stage_resolve_sku", "INTEGER DEFAULT 0"),
                 ("canonical_sku", "TEXT"),
                 ("canonical_product_name", "TEXT"),
+                ("device_class", "TEXT"),
             ]
             for col, ddl in migrations:
                 if col not in existing_cols:
