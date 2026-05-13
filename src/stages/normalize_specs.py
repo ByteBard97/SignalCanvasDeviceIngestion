@@ -329,19 +329,32 @@ def _is_power_port(port: dict) -> bool:
 def _is_control_port(port: dict) -> bool:
     """Return True if this port is a control/data port (not an audio signal-flow port).
 
-    USB ports, logic I/O, and control-only network ports are not audio signal paths.
-    They should not appear in PatchLang templates.
+    USB config/service ports, logic I/O, and control-only network ports are not
+    audio signal paths.  USB *audio* ports (e.g. on audio interfaces, mics,
+    recorders) ARE signal-flow ports and should be kept.
     """
     name = (port.get("name") or "").lower()
     connector = (port.get("connector") or "").lower()
-    # Drop any port whose primary identity is USB
-    if "usb" in name:
+
+    # Keep USB ports that are explicitly audio-related
+    if "usb audio" in name or "usb streaming" in name:
+        return False
+
+    # Drop USB ports whose name clearly indicates control/config purpose
+    usb_control_keywords = ["config", "service", "hid", "firmware", "update", "debug", "mgmt"]
+    if "usb" in name and any(kw in name for kw in usb_control_keywords):
         return True
-    if connector in ("usb", "usb-a", "usb_b", "usb-b", "usb_c", "usb-c"):
-        return True
+
     # Drop logic I/O ports (GPI/GPO, GPIO)
     if name in ("gpi", "gpo", "gpio"):
         return True
+
+    # For non-USB-named ports with USB connectors (e.g. "Console" on USB-A),
+    # drop only if the name also suggests control
+    control_names = {"console", "service", "config", "setup", "debug", "firmware", "update"}
+    if any(cn in name for cn in control_names) and "usb" in connector:
+        return True
+
     return False
 
 

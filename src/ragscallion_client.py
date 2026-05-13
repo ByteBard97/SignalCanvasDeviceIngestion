@@ -16,11 +16,23 @@ except ImportError:
     except ImportError:
         ASYNC_LIB = None
 
+# Build network exception tuple dynamically for retry logic
+_NETWORK_EXCEPTIONS: tuple[type[Exception], ...] = (
+    asyncio.TimeoutError,
+    ConnectionError,
+    OSError,
+)
+try:
+    import httpx as _httpx
+    _NETWORK_EXCEPTIONS += (_httpx.TimeoutException, _httpx.NetworkError)
+except ImportError:
+    pass
+
 logger = logging.getLogger(__name__)
 
 # Retry policy constants (no magic numbers)
 BACKOFF_DELAYS = [1, 4, 16]  # seconds: 1s, 4s, 16s for 3 retries
-TIMEOUT = 10  # seconds
+TIMEOUT = 120  # seconds — large PDFs (50+ MB) need time to upload over LAN
 MAX_RETRIES = 3
 
 
@@ -215,7 +227,7 @@ class RagscallionClient:
                                 f"Server returned {resp.status_code} after {MAX_RETRIES} attempts"
                             )
 
-            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+            except _NETWORK_EXCEPTIONS as e:
                 # Network failure (timeout, connection refused, etc.) — treat as 5xx
                 if attempt < MAX_RETRIES:
                     delay = BACKOFF_DELAYS[attempt - 1]
@@ -288,11 +300,12 @@ class RagscallionClient:
         if ASYNC_LIB == "aiohttp":
             import aiohttp
 
+            # aiohttp cannot serialize None in form fields — coerce to str
             form = aiohttp.FormData()
             form.add_field("file", file_data, filename=filename, content_type=content_type)
-            form.add_field("corpus_id", corpus_id)
-            form.add_field("source_label", source_label)
-            form.add_field("on_conflict", on_conflict)
+            form.add_field("corpus_id", corpus_id or "")
+            form.add_field("source_label", source_label or "")
+            form.add_field("on_conflict", on_conflict or "")
 
             return await self._retry_request(
                 "POST",

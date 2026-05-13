@@ -55,6 +55,7 @@ from .stages.generate_patch import generate_patch
 from .stages.normalize_specs import normalize_extraction
 from .stages.validate_patch import validate_patch
 from .stages.classify_device import classify
+from .stages.combined_device_context import get_combined_context
 
 # Stage status constants reused from pipeline_stages
 STAGE_COMPLETED = 2
@@ -63,7 +64,7 @@ STAGE_FAILED = 3
 logger = logging.getLogger(__name__)
 
 # Wall-clock hard cap (minutes)
-HARD_CAP_MINUTES = 90
+HARD_CAP_MINUTES = 360
 
 # Concurrency limits
 MAX_CONCURRENT_STAGE_1 = 3
@@ -190,7 +191,9 @@ async def _run_stage_34_batch(
     successful: list[DeviceNode] = []
     for node, result in zip(nodes, results):
         if isinstance(result, Exception):
-            logger.error(f"Device {node.device_id} Stage 3-4 exception: {result}")
+            logger.error(
+                f"Device {node.device_id} Stage 3-4 exception: {type(result).__name__}: {result}"
+            )
         elif result:
             successful.append(node)
 
@@ -214,8 +217,51 @@ async def _run_scope_check(nodes: list[DeviceNode], manifest: Manifest) -> list[
         if node.queue != QUEUE_0_INITIAL:
             kept.append(node)
             continue
+        # Skip nodes that already passed scope check in a previous pass
+        if node.stage_resolve_sku != STAGE_NOT_STARTED:
+            kept.append(node)
+            continue
 
-        classification = await classify(node.manufacturer, node.model)
+        # Pull EasySchematic context so the classifier has more than just
+        # manufacturer + model (e.g., "Cisco Codec Pro" gets deviceType=codec).
+        es_ctx = get_combined_context(node.device_id, node.manufacturer, node.model)
+
+        # Tier 0: Trust EasySchematic deviceType for clearly-AV categories.
+        # This bypasses the LLM entirely for known-AV types, preventing
+        # brand-bias misclassifications (e.g., Cisco codec, Crestron AV-over-IP).
+        AV_DEVICE_TYPES = {
+            "codec", "av-over-ip", "dsp", "mixer", "speaker", "camera",
+            "wireless_rx", "dante_stagebox", "dante_adapter_input",
+            "dante_adapter_output", "switcher", "router", "matrix",
+            "processor", "recorder", "player", "monitor", "display",
+            "projector", "microphone", "headset", "intercom", "stagebox",
+        }
+        es_device_type = (es_ctx.get("device_type") or "").lower().strip() if es_ctx else ""
+        if es_device_type in AV_DEVICE_TYPES:
+            logger.info(
+                f"Device {node.device_id}: AV pre-filter (device_type={es_device_type}) — kept"
+            )
+            kept.append(node)
+            continue
+
+        excerpt = ""
+        if es_ctx and es_ctx.get("sources"):
+            parts = []
+            if es_ctx.get("device_type"):
+                parts.append(f"Device type: {es_ctx['device_type']}")
+            if es_ctx.get("category"):
+                parts.append(f"Category: {es_ctx['category']}")
+            if es_ctx.get("ports"):
+                port_summary = ", ".join(
+                    f"{p['direction']} {p['signal_type']}"
+                    for p in es_ctx["ports"][:8]
+                )
+                parts.append(f"Ports: {port_summary}")
+            excerpt = "\n".join(parts)
+
+        classification = await classify(
+            node.manufacturer, node.model, markdown_excerpt=excerpt or None
+        )
         if classification.class_ == "it_networking":
             logger.info(
                 f"Device {node.device_id}: REJECTED — classified as {classification.class_} "
@@ -344,7 +390,9 @@ async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
     from .stages.normalize_specs import normalize_extraction
     from .stages.validate_patch import validate_patch
     from .stages.classify_device import classify
+    from .stages.review_completeness import check_completeness
     from .harness.manifest import (
+        QUEUE_3_READY_FOR_EXTRACTION,
         QUEUE_4_MANUAL_REVIEW,
         QUEUE_5_COMPLETED,
         FailureCategory,
@@ -407,12 +455,7 @@ async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
             node.stage_generate_patch = 2
 
             is_valid, errors = validate_patch(patch_source)
-            if is_valid:
-                node.stage_validate_patch = 2
-                node.patch_source = patch_source
-                successful += 1
-                logger.info(f"Device {node.device_id} patch generated and validated")
-            else:
+            if not is_valid:
                 node.failure_stage = 7
                 node.failure_category = FailureCategory.PATCH_VALIDATION_FAILED.value
                 node.failure_message = f"Patch validation failed: {errors}"
@@ -424,6 +467,52 @@ async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
                 node.patch_source = patch_source
                 failed += 1
                 logger.warning(f"Device {node.device_id} patch validation failed: {errors}")
+                manifest.persist(node)
+                continue
+
+            # Stage 7.5: Completeness review
+            node.stage_validate_patch = 2
+            is_complete, concerns = check_completeness(normalized, classification.class_)
+            if not is_complete:
+                review_attempts = extracted.get("_completeness_review_attempts", 0) + 1
+                logger.warning(
+                    f"Device {node.device_id}: completeness review FAILED "
+                    f"(attempt {review_attempts}) — {concerns}"
+                )
+                if review_attempts >= 2:
+                    # Two strikes — move to manual review rather than loop forever
+                    node.failure_stage = 7
+                    node.failure_category = FailureCategory.PATCH_VALIDATION_FAILED.value
+                    node.failure_message = (
+                        f"Completeness review failed after {review_attempts} attempts: {concerns}"
+                    )
+                    node.failure_retryable = True
+                    node.failure_attempts += 1
+                    node.failure_at = datetime.now(timezone.utc).isoformat()
+                    node.queue = QUEUE_4_MANUAL_REVIEW
+                    node.stage_generate_patch = 3
+                    manifest.persist(node)
+                    failed += 1
+                    continue
+
+                # Embed concerns so the next extraction pass can critique itself
+                extracted["_completeness_concerns"] = concerns
+                extracted["_completeness_review_attempts"] = review_attempts
+                node.specs_json = json.dumps(extracted)
+                # Reset stages so the node is re-extracted on next pipeline pass
+                node.stage_extract_specs = STAGE_NOT_STARTED
+                node.stage_generate_patch = STAGE_NOT_STARTED
+                node.stage_validate_patch = STAGE_NOT_STARTED
+                node.queue = QUEUE_3_READY_FOR_EXTRACTION
+                node.patch_source = ""
+                manifest.persist(node)
+                failed += 1
+                continue
+
+            node.patch_source = patch_source
+            node.queue = QUEUE_5_COMPLETED
+            successful += 1
+            logger.info(f"Device {node.device_id} patch generated and validated")
         except Exception as e:
             node.failure_stage = 6
             node.failure_category = FailureCategory.PATCH_GENERATION_FAILED.value
@@ -481,9 +570,12 @@ def _create_nodes(
             nodes.append(node)
             logger.info(f"Added device {device_id}")
         else:
-            # Node already exists — load it
+            # Node already exists — load it and backfill corpus_id if missing
             existing = manifest.get_node(device_id)
             if existing:
+                if not existing.corpus_id:
+                    existing.corpus_id = corpus_id
+                    manifest.persist(existing)
                 nodes.append(existing)
                 logger.info(f"Loaded existing device {device_id}")
     return nodes
@@ -553,6 +645,68 @@ def _print_summary(manifest: Manifest) -> None:
         print(f"{node.device_id}: {reason}")
 
 
+def _query_stage_0_nodes(manifest: Manifest) -> list[DeviceNode]:
+    return list({
+        n.device_id: n for n in (
+            manifest.list_by_queue(QUEUE_0_INITIAL)
+            + manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
+        )
+        if n.stage_resolve_sku in (STAGE_NOT_STARTED, STAGE_FAILED)
+    }.values())
+
+
+def _query_stage_1_nodes(manifest: Manifest) -> list[DeviceNode]:
+    return list({
+        n.device_id: n for n in (
+            manifest.list_by_queue(QUEUE_0_INITIAL)
+            + manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
+        )
+        if n.stage_resolve_sku == STAGE_COMPLETED
+        and n.stage_find_pdf == STAGE_NOT_STARTED
+        and n.canonical_sku
+    }.values())
+
+
+def _query_stage_1b_nodes(manifest: Manifest) -> list[DeviceNode]:
+    return [
+        n for n in (
+            manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
+            + manifest.list_by_queue(QUEUE_4_MANUAL_REVIEW)
+        )
+        if n.failure_category in (
+            FailureCategory.PDF_NOT_FOUND.value,
+            "HTML_SOURCE_NOT_FOUND",
+        )
+        and n.failure_retryable
+        and n.failure_attempts <= 2
+    ]
+
+
+def _query_stage_2_nodes(manifest: Manifest) -> list[DeviceNode]:
+    return list({
+        n.device_id: n for n in (
+            manifest.list_by_queue(QUEUE_0_INITIAL)
+            + manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
+        )
+        if n.stage_find_pdf == STAGE_COMPLETED
+        and n.stage_download_pdf not in (STAGE_COMPLETED, 1)
+        and n.failure_attempts < 5
+    }.values())
+
+
+def _query_stage_34_nodes(manifest: Manifest) -> list[DeviceNode]:
+    return list({
+        n.device_id: n for n in (
+            manifest.list_by_queue(QUEUE_0_INITIAL)
+            + manifest.list_by_queue(QUEUE_2_POLLING_RAGSCALLION)
+            + manifest.list_by_queue(QUEUE_4_MANUAL_REVIEW)
+        )
+        if n.stage_download_pdf == STAGE_COMPLETED
+        and n.stage_index_rag not in (STAGE_COMPLETED, 1)
+        and not (n.queue == QUEUE_4_MANUAL_REVIEW and not n.failure_retryable)
+    }.values())
+
+
 async def run_pipeline(
     devices_path: Path,
     cache_dir: Path,
@@ -579,15 +733,12 @@ async def run_pipeline(
         return
 
     # Fast-path: generate specs directly from patchify inputs/outputs when available.
-    # This skips the expensive PDF hunt for community entries that already have
-    # user-defined port data.
     patchify_fast_nodes = _run_patchify_fast_path(nodes, manifest)
     if patchify_fast_nodes:
         logger.info(
             f"Patchify fast-path: {len(patchify_fast_nodes)} device(s) skipped "
             f"PDF hunt (ports extracted from patchify inputs/outputs)"
         )
-        # Exclude fast-path nodes from subsequent stages
         fast_ids = {n.device_id for n in patchify_fast_nodes}
         nodes = [n for n in nodes if n.device_id not in fast_ids]
 
@@ -602,113 +753,114 @@ async def run_pipeline(
     )
 
     start_time = datetime.now(timezone.utc)
+    stop_event = asyncio.Event()
 
-    try:
-        # Stage 0: Resolve user-facing aliases to canonical manufacturer SKUs
-        queue_0_nodes = manifest.list_by_queue(QUEUE_0_INITIAL)
-        # Also pick up nodes in queue_1 that failed Stage 0 and need retry
-        queue_1_pending_sku = [
-            n for n in manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
-            if n.stage_resolve_sku in (STAGE_NOT_STARTED, STAGE_FAILED)
-        ]
-        stage_0_nodes = list({n.device_id: n for n in queue_0_nodes + queue_1_pending_sku}.values())
-        stage_0_success = await _run_stage_0_batch(manifest, stage_0_nodes)
+    # Per-stage workers: each polls the DB continuously and processes devices
+    # as soon as they become ready. Device A advances to Stage 2 the moment
+    # Stage 1 finishes for it — no waiting for the rest of the batch.
 
-        # Stage 1: Find PDF URLs (only for nodes that resolved their SKU)
-        # Re-load to pick up canonical_sku written by Stage 0.
-        stage_0_done = [
-            manifest.get_node(n.device_id)
-            for n in stage_0_success
-            if manifest.get_node(n.device_id) and manifest.get_node(n.device_id).canonical_sku
-        ]
-        # Also pick up nodes in queue_1 that haven't found a PDF yet
-        queue_1_pending_pdf = [
-            n for n in manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
-            if n.stage_find_pdf == STAGE_NOT_STARTED and n.canonical_sku
-        ]
-        stage_1_nodes = list({n.device_id: n for n in stage_0_done + queue_1_pending_pdf}.values())
-        stage_1_success = await _run_stage_1_batch(manifest, stage_1_nodes)
+    async def _stage_0_worker() -> None:
+        while not stop_event.is_set():
+            try:
+                batch = _query_stage_0_nodes(manifest)
+                if batch:
+                    await _run_stage_0_batch(manifest, batch)
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Stage 0 worker error (will retry): {e}")
+                await asyncio.sleep(2)
 
-        # Stage 1b: HTML fallback for nodes that failed PDF search
-        html_fallback_nodes = [
-            n for n in manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
-            if n.failure_category == FailureCategory.PDF_NOT_FOUND.value
-            and n.failure_retryable
-            and n.failure_attempts <= 2  # Don't retry indefinitely
-        ]
-        stage_1b_task: Optional[asyncio.Task] = None
-        if html_fallback_nodes:
-            logger.info(f"Stage 1b: trying HTML fallback for {len(html_fallback_nodes)} device(s)")
-            stage_1b_task = asyncio.create_task(
-                _run_stage_1b_batch(manifest, html_fallback_nodes, cache_dir)
-            )
+    async def _stage_1_worker() -> None:
+        while not stop_event.is_set():
+            try:
+                batch = _query_stage_1_nodes(manifest)
+                if batch:
+                    await _run_stage_1_batch(manifest, batch[:MAX_CONCURRENT_STAGE_1])
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Stage 1 worker error (will retry): {e}")
+                await asyncio.sleep(2)
 
-        # Stage 2: Download PDFs (concurrently with Stage 1b)
-        # Re-load nodes that completed stage 1 (queue may have changed)
-        stage_1_done = [
-            manifest.get_node(n.device_id)
-            for n in stage_1_success
-            if manifest.get_node(n.device_id) and manifest.get_node(n.device_id).stage_find_pdf == 2
-        ]
-        # Also pick up nodes in queue_1 that found PDF but haven't downloaded
-        queue_1_pending_download = [
-            n for n in manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
-            if n.stage_find_pdf == 2 and n.stage_download_pdf == STAGE_NOT_STARTED
-        ]
-        stage_2_nodes = list({n.device_id: n for n in stage_1_done + queue_1_pending_download}.values())
-        stage_2_success = await _run_stage_2_batch(manifest, stage_2_nodes, cache_dir)
+    async def _stage_1b_worker() -> None:
+        while not stop_event.is_set():
+            try:
+                batch = _query_stage_1b_nodes(manifest)
+                if batch:
+                    logger.info(f"Stage 1b: HTML fallback for {len(batch)} device(s)")
+                    await _run_stage_1b_batch(manifest, batch, cache_dir)
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Stage 1b worker error (will retry): {e}")
+                await asyncio.sleep(2)
 
-        # Await Stage 1b results (if it was started)
-        if stage_1b_task:
-            stage_1b_success = await stage_1b_task
-            logger.info(f"Stage 1b resolved {len(stage_1b_success)} device(s)")
+    async def _stage_2_worker() -> None:
+        while not stop_event.is_set():
+            try:
+                batch = _query_stage_2_nodes(manifest)
+                if batch:
+                    await _run_stage_2_batch(manifest, batch[:MAX_CONCURRENT_STAGE_2], cache_dir)
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Stage 2 worker error (will retry): {e}")
+                await asyncio.sleep(2)
 
-        # Stage 3-4: Submit to Ragscallion
-        stage_2_done = [
-            manifest.get_node(n.device_id)
-            for n in stage_2_success
-            if manifest.get_node(n.device_id) and manifest.get_node(n.device_id).stage_download_pdf == 2
-        ]
-        # Also pick up nodes already in queue_2 that haven't been submitted yet
-        # (e.g., after manifest reset or retry)
-        queue_2_pending = [
-            n for n in manifest.list_by_queue(QUEUE_2_POLLING_RAGSCALLION)
-            if n.stage_index_rag == STAGE_NOT_STARTED
-        ]
-        stage_34_nodes = list({n.device_id: n for n in stage_2_done + queue_2_pending}.values())
-        await _run_stage_34_batch(manifest, stage_34_nodes, ragscallion_client)
+    async def _stage_34_worker() -> None:
+        while not stop_event.is_set():
+            try:
+                batch = _query_stage_34_nodes(manifest)
+                if batch:
+                    await _run_stage_34_batch(manifest, batch[:MAX_CONCURRENT_STAGE_34], ragscallion_client)
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Stage 3-4 worker error (will retry): {e}")
+                await asyncio.sleep(2)
 
-        # Wait for queue_3 nodes to appear (polling loop moves them from queue_2)
-        logger.info("Waiting for Ragscallion indexing to complete...")
+    async def _stage_5_worker() -> None:
+        while not stop_event.is_set():
+            try:
+                result = await _run_stage_5_batch(manifest, ragscallion_client)
+                total = result.get("successful", 0) + result.get("failed", 0) + result.get("exceptions", 0)
+                if total == 0:
+                    await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Stage 5 worker error (will retry): {e}")
+                await asyncio.sleep(2)
+
+    async def _stage_67_worker() -> None:
+        while not stop_event.is_set():
+            try:
+                result = await _run_stage_67_batch(manifest)
+                if result.get("successful", 0) + result.get("failed", 0) == 0:
+                    await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Stage 6-7 worker error (will retry): {e}")
+                await asyncio.sleep(2)
+
+    async def _completion_checker() -> None:
         while True:
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
             if elapsed > HARD_CAP_MINUTES * 60:
                 logger.warning(f"Hard cap of {HARD_CAP_MINUTES} minutes reached")
+                stop_event.set()
                 break
-
-            queue_3_nodes = manifest.list_by_queue(QUEUE_3_READY_FOR_EXTRACTION)
-            queue_2_nodes = manifest.list_by_queue(QUEUE_2_POLLING_RAGSCALLION)
-
-            # Stage 6-7: Generate and validate PatchLang for any nodes
-            # that completed Stage 5 but haven't run Stage 6 yet.
-            # Run this BEFORE Stage 5 so patches are generated promptly
-            # without waiting for all extractions to finish.
-            await _run_stage_67_batch(manifest)
-
-            if queue_3_nodes:
-                # Stage 5: Extract specs
-                await _run_stage_5_batch(manifest, ragscallion_client)
-
             if _is_pipeline_done(manifest):
                 logger.info("Pipeline complete — no nodes remain in active queues")
+                stop_event.set()
                 break
-
-            if not queue_2_nodes and not queue_3_nodes:
-                # Nothing in flight and nothing to extract
-                break
-
             await asyncio.sleep(5)
 
+    try:
+        await asyncio.gather(
+            _stage_0_worker(),
+            _stage_1_worker(),
+            _stage_1b_worker(),
+            _stage_2_worker(),
+            _stage_34_worker(),
+            _stage_5_worker(),
+            _stage_67_worker(),
+            _completion_checker(),
+            return_exceptions=True,
+        )
     finally:
         polling_task.cancel()
         try:

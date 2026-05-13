@@ -49,17 +49,26 @@ def _build_easyschematic_index() -> None:
 
     for t in templates:
         mfg = (t.get("manufacturer") or "").strip()
-        model = (t.get("modelNumber") or t.get("label") or "").strip()
-        if not mfg or not model:
+        model = (t.get("modelNumber") or "").strip()
+        label = (t.get("label") or "").strip()
+        if not mfg:
             continue
 
-        key = _normalize_key(mfg, model)
-        _EASYSCHEMATIC_INDEX[key] = t
+        # Index by modelNumber (SKU) if present
+        if model:
+            key = _normalize_key(mfg, model)
+            _EASYSCHEMATIC_INDEX[key] = t
+            key_swapped = _normalize_key(model, mfg)
+            if key_swapped != key:
+                _EASYSCHEMATIC_INDEX[key_swapped] = t
 
-        # Also index by swapped mfg/model in case of bad data
-        key_swapped = _normalize_key(model, mfg)
-        if key_swapped != key:
-            _EASYSCHEMATIC_INDEX[key_swapped] = t
+        # Also index by human-readable label for lookup by product name
+        if label:
+            key_label = _normalize_key(mfg, label)
+            _EASYSCHEMATIC_INDEX[key_label] = t
+            key_label_swapped = _normalize_key(label, mfg)
+            if key_label_swapped != key_label:
+                _EASYSCHEMATIC_INDEX[key_label_swapped] = t
 
 
 def _build_patchify_index() -> None:

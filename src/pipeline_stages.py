@@ -5,6 +5,7 @@ Stages use constants for queue IDs and stage codes (no magic numbers).
 """
 
 import asyncio
+import os
 import json
 import logging
 import re
@@ -50,13 +51,14 @@ STAGE_COMPLETED = 2
 STAGE_FAILED = 3
 
 # Concurrency control
-EXTRACTION_SEMAPHORE = asyncio.Semaphore(3)  # Max 3 concurrent — prevents heartbeat death
+# EXTRACTION_CONCURRENCY env var allows tuning without code changes.
+# Default 3: previously shown to be safe; 5 caused heartbeat death (event loop starvation).
+# Increase carefully: monitor for asyncio heartbeat timeouts and Claude API 429s.
+MAX_CONCURRENT_EXTRACTIONS = int(os.environ.get("EXTRACTION_CONCURRENCY", "3"))
+EXTRACTION_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 FIND_PDF_SEMAPHORE = asyncio.Semaphore(3)    # Max 3 concurrent Stage 1 calls
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)    # Max 5 concurrent Stage 2 calls
-
-# Concurrency constants (no magic numbers)
-MAX_CONCURRENT_EXTRACTIONS = 3
-EXTRACTION_TIMEOUT_SECONDS = 600  # Complex devices (matrix switchers, consoles) need extra time
+EXTRACTION_TIMEOUT_SECONDS = 900  # Complex devices (matrix switchers, consoles) need extra time
 FIND_PDF_TIMEOUT_SECONDS = 120
 FIND_PDF_MAX_STEPS = 5  # tight budget; force fail-fast instead of broad exploration
 FIND_PDF_RETRY_ATTEMPTS = 2  # retry on empty Kimi output or model-mismatch URL
@@ -400,7 +402,7 @@ async def _attempt_name_correction(
 
     Returns True if a PDF was found after correction.
     """
-    from .kimi_runner import run_kimi, extract_json_block
+    from .claude_runner import run_extraction as run_kimi, extract_json_block
 
     # Only attempt correction for devices that look suspicious or already failed
     # PDF search. Skip obviously-good names.
@@ -626,7 +628,7 @@ async def stage_0_resolve_sku(
         return True
 
     async with RESOLVE_SKU_SEMAPHORE:
-        from .kimi_runner import run_kimi, extract_json_block
+        from .claude_runner import run_extraction as run_kimi, extract_json_block
 
         repo_root = Path(__file__).resolve().parent.parent
         skills_dir = repo_root / ".claude" / "skills"
@@ -786,7 +788,7 @@ async def _find_spec_sheet_url(
         if _is_blocked_domain(node.pdf_url or ""):
             rejected_urls.append(node.pdf_url or "")
 
-        from .kimi_runner import run_kimi, extract_json_block
+        from .kimi_runner import run_kimi, extract_json_block  # PDF search: Kimi first
 
         repo_root = Path(__file__).resolve().parent.parent
         skills_dir = repo_root / ".claude" / "skills"
@@ -937,7 +939,7 @@ async def stage_1b_find_html_source(
         False if failure metadata set (HTML_SOURCE_NOT_FOUND).
     """
     async with FIND_HTML_SEMAPHORE:
-        from .kimi_runner import run_kimi, extract_json_block
+        from .kimi_runner import run_kimi, extract_json_block  # HTML source search: Kimi first
         from .stages.fetch_html_source import fetch_and_prepare_source
 
         repo_root = Path(__file__).resolve().parent.parent
@@ -1068,7 +1070,7 @@ async def _find_secondary_doc(
     on success or None on any failure (Kimi error, no match, validation reject).
     """
     async with FIND_PDF_SEMAPHORE:
-        from .kimi_runner import run_kimi, extract_json_block
+        from .kimi_runner import run_kimi, extract_json_block  # PDF retry: Kimi first
 
         repo_root = Path(__file__).resolve().parent.parent
         skills_dir = repo_root / ".claude" / "skills"
@@ -1537,7 +1539,7 @@ async def _request_alternate_pdf_url(
     is malformed. The caller is responsible for re-attempting the download with the
     returned URL — this function does not touch the manifest.
     """
-    from .kimi_runner import run_kimi, extract_json_block
+    from .kimi_runner import run_kimi, extract_json_block  # URL fallback search: Kimi first
 
     repo_root = Path(__file__).resolve().parent.parent
     skills_dir = repo_root / ".claude" / "skills"
@@ -1646,7 +1648,10 @@ async def stage_3_4_submit_to_ragscallion(
         True if spec_sheet successfully submitted (queue_2 polling).
         False if spec_sheet failed (queue_4 manual review).
     """
-    corpus_id = node.corpus_id  # Use sanitized corpus_id (may differ from device_id)
+    # Use sanitized corpus_id (may differ from device_id).
+    # Backfill from device_id if missing (legacy rows created before corpus_id
+    # was populated).
+    corpus_id = node.corpus_id or node.device_id
 
     # Locate the spec_sheet document row. If missing, fall back to node.pdf_path
     # for back-compat with rows created before device_documents existed.
@@ -1751,6 +1756,20 @@ async def stage_3_4_submit_to_ragscallion(
         logger.error(f"Device {node.device_id} submission error: {e}")
         return False
 
+    except Exception as e:
+        # Catch-all for unexpected errors (network timeouts, DB locks, etc.)
+        node.failure_stage = STAGE_INDEX_RAG
+        node.failure_category = FailureCategory.RAGDB_SUBMISSION_ERROR.value
+        node.failure_message = f"Unexpected error during RAG submission: {type(e).__name__}: {e}"
+        node.failure_retryable = True
+        node.failure_attempts += 1
+        node.failure_at = datetime.now(timezone.utc).isoformat()
+        node.queue = QUEUE_4_MANUAL_REVIEW
+        node.stage_index_rag = STAGE_FAILED
+        manifest.persist(node)
+        logger.error(f"Device {node.device_id} unexpected RAG submission error: {type(e).__name__}: {e}")
+        return False
+
 
 async def _submit_secondary_docs(
     node: DeviceNode,
@@ -1843,12 +1862,33 @@ async def stage_5_extract_specs(
     """
     async with EXTRACTION_SEMAPHORE:
         try:
+            # If a prior extraction failed completeness review, feed the concerns
+            # back to the agent so it can critique its own work.
+            critique_concerns: list[str] | None = None
+            if node.specs_json:
+                try:
+                    prior = json.loads(node.specs_json)
+                    critique_concerns = prior.get("_completeness_concerns")
+                    if critique_concerns:
+                        logger.info(
+                            f"Device {node.device_id}: re-extracting with "
+                            f"{len(critique_concerns)} completeness concern(s)"
+                        )
+                except Exception:
+                    pass
+
+            from .stages.classify_device import classify as _classify
+            _classification = await _classify(node.manufacturer, node.model)
+            device_class = _classification.class_
+
             spec_json = await _extract_specs_via_agent(
                 manufacturer=node.manufacturer,
                 model=node.model,
                 corpus_id=node.corpus_id,
                 rag_search=lambda q: ragscallion_client.search(q, corpus=node.corpus_id),
                 device_id=node.device_id,
+                critique_concerns=critique_concerns,
+                device_class=device_class,
             )
 
             if not spec_json:
@@ -1909,6 +1949,8 @@ async def _extract_specs_via_agent(
     corpus_id: str,
     rag_search,
     device_id: str = "",
+    critique_concerns: list[str] | None = None,
+    device_class: str = "generic",
 ) -> Optional[str]:
     """Extract device specs via Kimi CLI using RAG context.
 
@@ -1926,7 +1968,7 @@ async def _extract_specs_via_agent(
     Returns:
         JSON string of extracted specs, or None if extraction failed.
     """
-    from .kimi_runner import run_kimi, extract_json_block
+    from .claude_runner import run_extraction_routed, extract_json_block
     from .stages.combined_device_context import get_context_as_prompt_text
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -1957,10 +1999,27 @@ async def _extract_specs_via_agent(
             f"\n"
             f"IMPORTANT: The context above is a STARTING POINT from community data.\n"
             f"It may be WRONG, OUTDATED, or INCOMPLETE. Your job is to:\n"
-            f"1. VERIFY the port list against the Ragscallion corpus (datasheet chunks).\n"
-            f"2. CORRECT any errors in the known ports.\n"
-            f"3. DISCOVER bridge/routing information that the context explicitly says is missing.\n"
-            f"4. Use the reference URL (if provided) as a starting point for verification.\n"
+            f"1. START from the known port list above.\n"
+            f"2. ADD any additional ports found in the Ragscallion corpus (datasheet chunks).\n"
+            f"3. PRESERVE context ports even if the corpus does not mention them — "
+            f"the corpus may be incomplete. Only REMOVE a context port if the corpus "
+            f"EXPLICITLY CONTRADICTS it (e.g., says 'this model does NOT have XLR outputs').\n"
+            f"4. CORRECT any clear errors in the known ports (wrong connector, wrong direction).\n"
+            f"5. DISCOVER bridge/routing information that the context explicitly says is missing.\n"
+            f"6. Use the reference URL (if provided) as a starting point for verification.\n"
+        )
+
+    if critique_concerns:
+        prompt += (
+            f"\n"
+            f"CRITIQUE — A PREVIOUS EXTRACTION OF THIS DEVICE WAS FLAGGED AS INCOMPLETE:\n"
+        )
+        for i, concern in enumerate(critique_concerns, 1):
+            prompt += f"{i}. {concern}\n"
+        prompt += (
+            f"\n"
+            f"You MUST address every concern above. Re-examine the corpus carefully "
+            f"and produce a MORE COMPLETE extraction. Do not simply repeat the previous output.\n"
         )
 
     prompt += (
@@ -1971,10 +2030,12 @@ async def _extract_specs_via_agent(
         f"3. Emit ONLY valid JSON on stdout — no markdown, no explanations.\n"
     )
 
-    stdout = await run_kimi(
+    stdout = await run_extraction_routed(
         prompt,
         skills_dir=skills_dir,
         work_dir=repo_root,
+        device_class=device_class,
+        has_critique=bool(critique_concerns),
         timeout=EXTRACTION_TIMEOUT_SECONDS,
     )
     if stdout is None:

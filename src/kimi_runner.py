@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import os
 import shutil
+import signal
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +13,25 @@ logger = logging.getLogger(__name__)
 
 # Kimi CLI binary name
 KIMI_BINARY = "kimi"
+
+
+async def _kill_proc_group(proc: asyncio.subprocess.Process) -> None:
+    """Kill the entire process group of a subprocess."""
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    # Fallback: kill the process directly
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    # Wait with a short timeout
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        pass
 
 
 async def run_kimi(
@@ -55,25 +76,26 @@ async def run_kimi(
 
     logger.debug("Running Kimi command: %s", " ".join(cmd))
 
+    proc: Optional[asyncio.subprocess.Process] = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
     except asyncio.TimeoutError:
         logger.error("Kimi subprocess timed out after %.0fs", timeout)
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+        if proc is not None:
+            await _kill_proc_group(proc)
         return None
     except Exception as exc:
         logger.error("Kimi subprocess failed: %s", exc)
+        if proc is not None:
+            await _kill_proc_group(proc)
         return None
 
     stdout = stdout_bytes.decode("utf-8", errors="replace")

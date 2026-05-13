@@ -44,6 +44,9 @@ class Classification:
 # Rule table: list of (manufacturer_pattern, model_pattern, class_)
 # ---------------------------------------------------------------------------
 RULE_TABLE: list[tuple[str, str, str]] = [
+    # Cisco AV codecs and cameras (in scope) — must come before IT rules
+    # so the LLM never sees them and misclassifies based on brand bias
+    (r"Cisco", r"Codec.*|SX.*|MX.*|Room\s*Kit.*|Room\s*Bar.*|Room\s*Navigator.*|Webex.*|Precision.*|SpeakerTrack.*|TelePresence.*|P40.*|P60.*|Desk.*", "generic"),
     # IT / Networking — explicitly out of scope for SignalCanvas
     (r"Cisco", r"SF.*|Catalyst.*|Nexus.*|ISR.*|ASA.*|Meraki.*|SG.*|CBS.*", "it_networking"),
     (r"Ubiquiti", r"USW.*|UDM.*|USG.*|EdgeRouter.*|EdgeSwitch.*|UAP.*", "it_networking"),
@@ -76,6 +79,40 @@ RULE_TABLE: list[tuple[str, str, str]] = [
     (r"Allen.*Heath", r"SQ-.*", "mixing_console"),
     # DSP processors
     (r"QSC", r"Core.*", "dsp_processor"),
+    # NDI devices — use NDI not Dante; never dante_*
+    (r"BirdDog", r".*", "generic"),
+    # Passive speakers and subwoofers — no network audio
+    (r"L-Acoustics", r"SB.*|KS.*|X.*|A.*|ARCS.*|K1.*|K2.*|K3.*|V.*", "generic"),
+    # Power amplifiers — analogue signal only
+    (r"Behringer", r"NX.*|iNUKE.*|EP.*|KM.*|A500.*", "generic"),
+    # USB audio interfaces — USB only, no Dante
+    (r"ESI", r"MAYA.*|UGM.*|U46.*|M4U.*|PLANET.*", "generic"),
+    (r"Zoom", r"AMS.*|UAC.*|U-.*|H.*|R.*", "generic"),
+    # Riedel intercom — uses proprietary Artist/Bolero network, not Dante
+    (r"Riedel", r"DCP.*|RSP.*|RCP.*|CCP.*|1200.*|1300.*|2300.*|2400.*|MediorNet.*|Bolero.*", "generic"),
+    # LED video processors — video only, no audio network
+    (r"Novastar", r".*", "generic"),
+    (r"NovaStar", r".*", "generic"),
+    # HDMI/HDBaseT extenders — video over IP, no audio Dante
+    (r"OREI", r".*", "generic"),
+    # Broadcast playout / monitoring
+    (r"Domo.*Broadcast", r".*", "generic"),
+    (r"EVS", r"CGP.*|XS.*|XT.*|IPD.*", "generic"),
+    # Allen & Heath expansion cards — M-AIN is analogue, M-DL-AES* is AES3
+    # Only M-DL-DANTE* cards are actual Dante cards
+    (r"Allen.*Heath", r"M-AIN.*|M-DL-AES.*|M-DL-ACE.*|M-DL-MADI.*", "generic"),
+    (r"Allen.*Heath", r"M-DL-DANTE.*|M-DL-WAVES.*", "dante_adapter_input"),
+    # Yamaha wireless USB receivers — USB dongle, not Dante
+    (r"Yamaha", r"URX.*", "generic"),
+    # Extron: only "AT" suffix models use Audinate Dante (e.g. "DMP 128 Plus AT")
+    # All other Extron models use DTP/HDBaseT/analogue — not Dante
+    (r"Extron", r".*\bAT\b.*|.*Dante.*", "dante_adapter_output"),
+    (r"Extron", r".*", "generic"),
+    # Biamp Tesira uses AVB, not Dante. EX-* expansion modules are small (1-2 ports),
+    # so use generic rather than dsp_processor (which requires 4+ ports)
+    (r"Biamp", r".*", "generic"),
+    # Sonifex AVN series uses Ravenna/AES67, not Dante
+    (r"Sonifex", r".*", "generic"),
 ]
 
 VALID_CLASSES = {
@@ -119,9 +156,24 @@ _CLASSIFICATION_SYSTEM_PROMPT = (
     "Given a manufacturer and model, emit exactly one classification token from this list:\n"
     "dante_stagebox, dante_adapter_input, dante_adapter_output, "
     "wireless_rx, mixing_console, dsp_processor, it_networking, generic\n\n"
-    "Use 'it_networking' for switches, routers, firewalls, access points, and other pure "
-    "networking/IT infrastructure. Use 'generic' for any AV device that does not fit the "
-    "specific categories above.\n"
+    "CLASS DEFINITIONS:\n"
+    "- dante_stagebox: A box whose primary purpose is bridging Audinate Dante network audio to "
+    "analogue/AES/MADI, with many I/O channels (e.g. Yamaha Rio, Focusrite RedNet, Luminex LumiNode). "
+    "MUST use Audinate Dante specifically — NOT NDI, AVB, Ravenna, AES67, or other AoIP.\n"
+    "- dante_adapter_input: A small adapter whose sole job is converting analogue/AES input to Dante "
+    "(e.g. Audinate AVIO). MUST use Audinate Dante specifically.\n"
+    "- dante_adapter_output: A small adapter whose sole job is converting Dante to analogue/AES output. "
+    "MUST use Audinate Dante specifically.\n"
+    "- wireless_rx: A wireless microphone or IEM receiver (e.g. Shure ULXD4, Sennheiser EW-DX EM).\n"
+    "- mixing_console: A hardware audio mixing console.\n"
+    "- dsp_processor: A dedicated DSP signal processor (e.g. QSC Core, Biamp Tesira, BSS Audio).\n"
+    "- it_networking: Switches, routers, firewalls, access points, NAS/storage — IT infrastructure.\n"
+    "- generic: Everything else — cameras, projectors, displays, speakers, amplifiers, recorders, "
+    "intercoms, video converters, NDI devices, AVB devices, AES67 devices, USB audio interfaces, "
+    "power amplifiers, passive speakers, or any device you are not certain fits a specific class.\n\n"
+    "CRITICAL: Only use dante_stagebox/dante_adapter_input/dante_adapter_output if you are CERTAIN "
+    "the device uses Audinate Dante. When in doubt, use 'generic'.\n\n"
+    "IMPORTANT: Some manufacturers make both AV and IT products. Classify based on the specific model.\n"
     "Respond with ONLY the token, no punctuation or explanation."
 )
 
