@@ -1,90 +1,79 @@
 # SignalCanvas Device Ingestion Pipeline
 
-Automated pipeline to convert AV device manufacturer manuals into SignalCanvas device templates (PatchLang `.patch` files) with complete signal routing schema.
+Automated pipeline to convert AV device manufacturer manuals into SignalCanvas device templates
+(PatchLang `.patch` files) with complete signal routing schema.
+
+4,000+ devices. ~$20–25 in LLM costs. Runs overnight.
+
+## What It Does
+
+```
+Device list (manufacturer + model)
+    │
+    ▼
+Stage 1  Find PDF      — Web search + Haiku validation to locate datasheets
+Stage 2  Download      — Fetch PDFs, validate as real files, cache locally
+Stage 3  Index RAG     — Submit to Ragscallion for GPU-accelerated indexing
+Stage 4  Poll          — Wait for Ragscallion to finish embedding
+Stage 5  Extract specs — Kimi agent queries the indexed manual, returns structured JSON
+Stage 6  Generate      — Build PatchLang template from spec JSON
+Stage 7  Validate      — Compile through PatchLang Rust checker; only valid files written
+    │
+    ▼
+output/stdlib/devices/*.patch  — ready for SignalCanvas stdlib
+```
+
+Each stage is independently retryable. A SQLite manifest tracks every device through the pipeline,
+so overnight runs survive crashes and resume from the last checkpoint.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for why the pipeline is structured this way.
 
 ## Quick Start
 
 ```bash
-# Setup
-git clone <repo>
+git clone https://github.com/SignalCanvas/SignalCanvasDeviceIngestion
 cd SignalCanvasDeviceIngestion
 pip install -r requirements.txt
+```
 
-# Build compiler (one-time)
-cd ../SignalCanvasLang/crates/patchlang-python
-maturin develop
+Set up dependencies (see below), then run the pipeline:
 
-# Run Phase 1 (test harness on 50 known devices)
-python src/pipeline.py --phase 1 --max-devices 50
+```bash
+# Stages 5–7: extract specs, generate + validate PatchLang templates
+python scripts/run_pipeline.py
 
-# Check report
+# Multiple extraction shots per device (improves accuracy, increases cost)
+python scripts/run_pipeline.py --n-shot 3
+
+# Check results
 cat output/validation_report.json
 ```
 
-## What It Does
+## Dependencies
 
-1. **Finds PDF manuals** via web search + Haiku validation (~$0.001 per device)
-2. **Downloads + validates** PDFs as real files
-3. **Converts with Marker** to structured markdown
-4. **Indexes in RAG DB** for semantic search
-5. **Extracts signal routing specs** via Haiku agent querying RAG
-6. **Generates PatchLang templates** using Rust compiler Python binding
-7. **Validates against compiler** — only valid `.patch` files written to output
+### 1. Ragscallion
 
-## Output
-
-- `output/stdlib/devices/*.patch` — Valid device templates, ready for SignalCanvas stdlib
-- `output/validation_report.json` — Per-device success/failure with diagnostics
-
-## Cost
-
-- **Total**: ~$50 for 4,000 devices
-  - Haiku agents: ~$20
-  - Web search: Free (Claude Code built-in)
-  - Local tools: Free
-
-## Timeline
-
-- **Phase 1** (Week 1): Test harness on 50 known devices → refine process
-- **Phase 2** (Week 2-3): 1,500 mid-tier devices → apply learnings
-- **Phase 3** (Week 4): Remaining devices → accept lower hit rate
-
-Total runtime: 1 week (overnight/evening runs), fully debuggable.
-
-## Architecture
-
-See `IMPLEMENTATION.md` for:
-- Module structure and APIs
-- Compiler integration details
-- RAG database design
-- Failure handling strategies
-- Test harness design
-
-## Requirements
-
-See `REQUIREMENTS.md` for:
-- What we're building (7-stage pipeline)
-- Core requirements (R1-R10)
-- Success criteria
-- Open questions
-
-## Setup
-
-### Prerequisites
-
-**Ragscallion RAG microservice must be running.** The pipeline delegates PDF indexing and semantic search to Ragscallion instead of building its own RAG system.
+[Ragscallion](https://github.com/ByteBard97/ragscallion) is a local-first RAG server that handles
+PDF ingestion, GPU-accelerated embedding, and hybrid vector+BM25 search. The pipeline delegates
+all document indexing and semantic search to it over HTTP.
 
 ```bash
-# Clone and start Ragscallion (runs on 192.168.0.200:8086)
 git clone https://github.com/ByteBard97/ragscallion
 cd ragscallion
-python server.py 8086
+uv sync
+uv run python server.py 8086
 
-# Verify it's running
-curl http://localhost:8086/health  # Should return "ok"
+# Verify
+curl http://localhost:8086/health  # → "ok"
 ```
 
-**PatchLang compiler** must be built from the sibling SignalCanvasLang repo:
+Ragscallion requires an NVIDIA GPU with CUDA. It can run on the same machine as the pipeline
+or on a separate box — set `RAGSCALLION_HOST` in your `.env` accordingly.
+
+### 2. PatchLang compiler
+
+The PatchLang compiler validates generated `.patch` files. Built from the sibling
+[SignalCanvasLang](https://github.com/SignalCanvas/SignalCanvasLang) repo:
 
 ```bash
 cd ../SignalCanvasLang/crates/patchlang-python
@@ -92,53 +81,33 @@ pip install maturin
 maturin develop
 ```
 
-### Dependencies
+### 3. Environment
 
 ```bash
-# Install Python dependencies
-pip install -r requirements.txt
-
-# Or manually:
-pip install pydantic click pydantic-settings requests langgraph langchain sentence-transformers
-```
-
-### Environment
-
-```bash
-# Create .env from template
 cp .env.example .env
-
-# Edit .env and set:
-CLAUDE_API_KEY=sk-ant-...
-RAGSCALLION_HOST=192.168.0.200      # Where your Ragscallion server is running
-RAGSCALLION_PORT=8086
-RAGSCALLION_SSH_USER=your-username
-RAGSCALLION_SSH_HOST=192.168.0.200
+# Edit .env — set CLAUDE_API_KEY, MOONSHOT_API_KEY, and RAGSCALLION_HOST
 ```
 
-### Architecture
+Required keys:
+- `CLAUDE_API_KEY` — Anthropic API key (for Stage 1 PDF discovery via Claude Haiku)
+- `MOONSHOT_API_KEY` — Moonshot/Kimi API key (for Stage 5 spec extraction)
 
-```
-Device Input
-    ↓
-[Pipeline Harness] ← SQLite manifest (persistent state)
-    ↓
-Stage 1-4: Find → Download → Convert → Index
-    ↓
-[Ragscallion RAG] ← Indexed device manuals + vector embeddings
-    ↓
-Stage 5-7: Extract specs → Generate patch → Validate
-    ↓
-Valid .patch files → output/stdlib/devices/
-Invalid → output/validation_report.json
-```
+If Ragscallion is running on the same machine, the defaults in `.env.example` work without changes.
 
-**Key dependency:** Ragscallion is responsible for:
-- PDF → Markdown conversion via Marker (GPU-accelerated on Linux box)
-- Vector embedding and semantic search for spec extraction
-- Device manual indexing and retrieval
+## Cost
 
-The pipeline runs on your local machine and delegates these operations to Ragscallion via HTTP + SSH.
+| Stage | Model | Cost for 4,000 devices |
+|-------|-------|------------------------|
+| 1 — Find PDF | Claude Haiku | ~$4 |
+| 5 — Extract specs | Kimi (Moonshot) 128K | ~$15–20 |
+| 2–4, 6–7 | Local tools / Ragscallion | Free |
+| **Total** | | **~$20–25** |
+
+## Output
+
+- `output/stdlib/devices/*.patch` — valid device templates, ready for the SignalCanvas stdlib
+- `output/ingestion.db` — SQLite manifest with per-device stage history
+- `output/validation_report.json` — per-device success/failure with diagnostics
 
 ## Development
 
@@ -146,36 +115,32 @@ The pipeline runs on your local machine and delegates these operations to Ragsca
 # Run tests
 pytest tests/
 
-# Run with debug logging
-RUST_LOG=debug python src/pipeline.py --phase 1
-
-# Check compiler validation works
+# Check compiler works
 python -c "import patchlang_python; print(patchlang_python.validate('template Foo {}'))"
 ```
 
 ## Status
 
-**Phase 0: Harness Validation** (Current)
-- [x] Ragscallion RAG microservice running
-- [x] Core harness + manifest persistence
-- [x] LangGraph pipeline orchestrator
-- [x] Phase 0 ground truth fixtures (3 devices)
-- [x] Test suite + connectivity checks
-- [ ] Stage implementations (7 stages to build)
+**Phase 0 — Harness Validation** (done)
+- [x] Ragscallion integration (multi-doc: spec sheet + user manual + install guide)
+- [x] SQLite manifest with checkpoint/resume
+- [x] Pipeline orchestrator
+- [x] Ground truth fixtures + test suite
 
-**Phase 1: Test Harness** (Next)
-- [ ] Implement all 7 pipeline stages
+**Phase 1 — Test Harness** (next)
 - [ ] Validate on 50 known devices
-- [ ] Refine extraction logic based on failures
+- [ ] Tune extraction prompts based on failure analysis
 
-**Phase 2-3: Scaling** (Follow-up)
+**Phase 2–3 — Scale**
 - [ ] 1,500 mid-tier devices
 - [ ] Remaining 2,000+ devices
-- [ ] QA pipeline + sampling validation
+
+## Related Projects
+
+- [SignalCanvasLang](https://github.com/SignalCanvas/SignalCanvasLang) — the PatchLang DSL and Rust compiler this pipeline targets
+- [Ragscallion](https://github.com/ByteBard97/ragscallion) — the local RAG server powering document indexing and search
+- [EasySchematic](https://easyschematic.live) — browser-based AV signal flow diagram tool with its own device library (2,000+ templates). Both tools are building structured device databases for AV system design; there's natural overlap and interest in format interop.
 
 ---
 
-**Repo:** https://github.com/ByteBard97/SignalCanvasDeviceIngestion  
-**Owner:** ByteBard97 + Reid (reidwwall)  
-**Dependency:** https://github.com/ByteBard97/ragscallion (must be running)  
-**Next:** Implement Stage 1-7 pipeline modules
+**Repo:** https://github.com/SignalCanvas/SignalCanvasDeviceIngestion

@@ -15,12 +15,12 @@ class Settings(BaseSettings):
     manifests_db: Path = Path("output/ingestion.db")
     pdf_cache_dir: Path = Path("output/pdf_cache")
 
-    # Ragscallion RAG microservice
-    ragscallion_host: str = "192.168.0.200"
+    # Ragscallion RAG microservice (https://github.com/ByteBard97/ragscallion)
+    ragscallion_host: str = "localhost"
     ragscallion_port: int = 8086
-    ragscallion_ssh_user: str = "geoff"
-    ragscallion_ssh_host: str = "192.168.0.200"
-    ragscallion_script_path: str = "~/projects/device-library-rag/scripts/add-paper.sh"
+    ragscallion_ssh_user: str = "your-username"
+    ragscallion_ssh_host: str = "localhost"
+    ragscallion_script_path: str = "~/projects/ragscallion/scripts/add-paper.sh"
 
     # API keys
     claude_api_key: str = ""  # Set from environment

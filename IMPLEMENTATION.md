@@ -633,17 +633,17 @@ class SpecExtractorAgent:
 
 ## Pre-Pipeline Setup: Ragscallion Health Check
 
-**Before running the pipeline, verify Ragscallion is running on 192.168.0.200:**
+**Before running the pipeline, verify Ragscallion is running on localhost:**
 
 ```bash
 # Quick health check
-curl http://192.168.0.200:8086/health
+curl http://localhost:8086/health
 
 # List indexed sources
-curl http://192.168.0.200:8086/sources
+curl http://localhost:8086/sources
 
 # Get stats
-curl http://192.168.0.200:8086/stats
+curl http://localhost:8086/stats
 ```
 
 **If Ragscallion is not running:**
@@ -723,7 +723,7 @@ The SignalCanvasLang repo includes a Python wheel (via PyO3). Integration steps:
 
 ## RAG Integration with Ragscallion
 
-**Ragscallion** (https://github.com/ByteBard97/ragscallion) is your existing microservice running on 192.168.0.200. It handles all RAG infrastructure:
+**Ragscallion** (https://github.com/ByteBard97/ragscallion) is your existing microservice running on localhost. It handles all RAG infrastructure:
 
 - **Vector DB**: LanceDB (embedded, persistent files)
 - **Search Index**: Tantivy (full-text search, BM25)
@@ -735,7 +735,7 @@ The SignalCanvasLang repo includes a Python wheel (via PyO3). Integration steps:
 ```python
 class RAGDatabase:
     def __init__(self):
-        self.rag_host = "192.168.0.200"
+        self.rag_host = "localhost"
         self.rag_port = 8086  # Device library RAG
         self.base_url = f"http://{self.rag_host}:{self.rag_port}"
     
@@ -780,7 +780,7 @@ class RAGDatabase:
 
 **Why delegate to Ragscallion?**
 
-- ✅ **Already running** — 192.168.0.200:8086, proven in production
+- ✅ **Already running** — localhost:8086, proven in production
 - ✅ **GPU-accelerated** — NVIDIA card handles embeddings (768-dim BAAI model)
 - ✅ **Hybrid search** — Both vector + FTS for best recall on technical docs
 - ✅ **Production-grade** — LanceDB used by Hugging Face, LlamaIndex
@@ -796,7 +796,7 @@ class RAGDatabase:
    - Chunks markdown
    - Creates embeddings (GPU)
    - Stores in LanceDB
-3. **Stage 5 (Extract Specs)** — Query `/search` endpoint at 192.168.0.200:8086
+3. **Stage 5 (Extract Specs)** — Query `/search` endpoint at localhost:8086
 
 ---
 
@@ -852,7 +852,7 @@ class Config:
     ssh_timeout: int = 120  # Marker can be slow on GPUs
     
     # Ragscallion RAG (remote microservice)
-    rag_host: str = "192.168.0.200"
+    rag_host: str = "localhost"
     rag_port: int = 8086
     rag_ssh_user: str = "your-username"
     rag_script_path: str = "~/projects/ragscallion/scripts/add-paper.sh"
@@ -959,7 +959,7 @@ This ensures generated templates are accurate before merging to SignalCanvasFron
 
 ### 3. Existing RAG Infrastructure
 
-**Device Library RAG Server** (at `your-username@localhost:~/projects/device-library-rag`)
+**Ragscallion RAG Server** (https://github.com/ByteBard97/ragscallion)
 - Already running on port 8086
 - Indexed with device manuals (PDFs → Markdown → Vector DB)
 - Query script: `SignalCanvasLang/scripts/rag-device-query.sh`
@@ -967,13 +967,13 @@ This ensures generated templates are accurate before merging to SignalCanvasFron
 **API Endpoints:**
 ```bash
 # Search for device specs
-curl "http://192.168.0.200:8086/search?q=yamaha+cl5+ports&n=5&mode=hybrid&source=yamaha-cl5"
+curl "http://localhost:8086/search?q=yamaha+cl5+ports&n=5&mode=hybrid&source=yamaha-cl5"
 
 # List indexed sources
-curl "http://192.168.0.200:8086/sources"
+curl "http://localhost:8086/sources"
 
 # Get index stats
-curl "http://192.168.0.200:8086/stats"
+curl "http://localhost:8086/stats"
 ```
 
 **Usage in our pipeline:**

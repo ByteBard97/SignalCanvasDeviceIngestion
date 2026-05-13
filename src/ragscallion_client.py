@@ -65,11 +65,11 @@ class RagscallionClient:
     - After 3 polling failures → Return empty (forgiving for polling)
     """
 
-    def __init__(self, base_url: str = "http://192.168.0.200:8086"):
+    def __init__(self, base_url: str = "http://localhost:8086"):
         """Initialize Ragscallion client.
 
         Args:
-            base_url: Base URL for Ragscallion API (default: Linux box at 8086)
+            base_url: Base URL for Ragscallion API (default: localhost:8086)
         """
         self.base_url = base_url.rstrip("/")
         self._session = None
