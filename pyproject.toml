@@ -7,7 +7,7 @@ name = "signal-canvas-device-ingestion"
 version = "0.1.0"
 description = "Automated pipeline to convert AV device manufacturer manuals into SignalCanvas device templates"
 authors = [
-    {name = "ByteBard97", email = "ByteBard97"},
+    {name = "ByteBard97"},
 ]
 requires-python = ">=3.11"
 license = {text = "MIT"}

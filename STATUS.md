@@ -216,5 +216,5 @@ Before each phase:
 
 ## Contact
 
-ByteBard97 (ByteBard97) — Project lead
+ByteBard97 — Project lead
 Reid — Domain expert (AV engineer, specs validation)
