@@ -98,6 +98,8 @@ def load_d_tier_devices(patches_dir: Path) -> list[dict]:
         manufacturer = meta.get("manufacturer", "")
         model = meta.get("model", "")
         mfg_slug = patch_file.parent.name
+        if mfg_slug == "_uncategorized":
+            continue
         device_id = patch_file.stem
         devices.append({
             "device_id": device_id,
