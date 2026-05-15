@@ -30,6 +30,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-file", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--batch-name", type=str, required=True, help="Batch name written into meta (e.g. batch_300_v1)")
     parser.add_argument("--target-size", type=int, default=40)
     parser.add_argument("--max-batches", type=int, default=10)
     parser.add_argument("--cache-dir", type=Path, default=Path("output/pdfs"))
@@ -52,14 +53,14 @@ def main() -> int:
             print(f"Pipeline exited with code {ret}, stopping rolling runner")
             return ret
 
-        # Export completed patches to library intake
+        # Export completed patches to library
         print(f"\n{'='*60}")
         print("Exporting completed patches...")
         print(f"{'='*60}\n")
         run_command([
             sys.executable, "scripts/export_patches.py",
             "--db", str(args.manifest),
-            "--out", "/Users/ceres/Desktop/SignalCanvas/SignalCanvasDeviceLibrary/intake",
+            "--batch", args.batch_name,
         ])
 
         # Add replacements for completed + correctly rejected devices

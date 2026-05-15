@@ -10,8 +10,7 @@ Usage:
 """
 
 import argparse
-import json
-import os
+import csv
 import random
 import re
 import sqlite3
@@ -24,118 +23,109 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from harness.manifest import Manifest, QUEUE_4_MANUAL_REVIEW, QUEUE_5_COMPLETED
 
-BLACKLIST_PATH = Path("output/blacklisted_devices.txt")
-EASYSCHEMATIC_PATH = Path("output/easyschematic/unmatched_devices.json")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+LIBRARY_ROOT = REPO_ROOT.parent / "SignalCanvasDeviceLibrary"
+PATCHES_DIR = LIBRARY_ROOT / "patches"
+EXCLUDED_CSV = LIBRARY_ROOT / "excluded.csv"
+OUTPUT_DIR = REPO_ROOT / "output"
+
+VALID_REASON_CODES = {"CIT", "OOS", "DUP", "DSC", "NDS"}
+
+_META_FIELD_RE = re.compile(r'(\w+):\s*"([^"]*)"')
 
 
-def slugify(text: str) -> str:
-    text = text.lower().strip()
-    text = text.replace("&", "and")
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", "-", text)
-    text = text.strip("-")
-    return text
-
-
-def make_device_id(mfg: str, model: str) -> str:
-    mfg_slug = slugify(mfg)
-    model_slug = slugify(model)
-    if model_slug.startswith(mfg_slug + "-") or model_slug == mfg_slug:
-        return model_slug[:64]
-    return f"{mfg_slug}-{model_slug}"[:64]
-
-
-def load_blacklist() -> set[str]:
-    if not BLACKLIST_PATH.exists():
-        return set()
-    return {line.strip() for line in BLACKLIST_PATH.read_text().splitlines() if line.strip()}
-
-
-def add_to_blacklist(device_id: str, reason: str) -> None:
-    BLACKLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(BLACKLIST_PATH, "a") as f:
-        f.write(f"{device_id}|{reason}\n")
-
-
-def load_easyschematic_pool() -> list[dict]:
-    with open(EASYSCHEMATIC_PATH) as f:
-        return json.load(f)
-
-
-def get_processed_ids(manifest_db: Path) -> set[str]:
-    processed = set()
-    for db_file in os.listdir("output"):
-        if not db_file.endswith(".db"):
+def _parse_meta(patch_text: str) -> dict[str, str]:
+    meta: dict[str, str] = {}
+    in_meta = False
+    for line in patch_text.splitlines():
+        stripped = line.strip()
+        if stripped == "meta {":
+            in_meta = True
             continue
+        if in_meta:
+            if stripped == "}":
+                break
+            m = _META_FIELD_RE.match(stripped)
+            if m:
+                meta[m.group(1)] = m.group(2)
+    return meta
+
+
+def load_excluded() -> set[str]:
+    excluded: set[str] = set()
+    if not EXCLUDED_CSV.exists():
+        return excluded
+    with EXCLUDED_CSV.open(newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            device_id = row.get("device_id", "").strip()
+            if device_id:
+                excluded.add(device_id)
+    return excluded
+
+
+def load_processed_from_dbs() -> set[str]:
+    processed: set[str] = set()
+    for db_path in OUTPUT_DIR.rglob("manifest.db"):
         try:
-            conn = sqlite3.connect(f"output/{db_file}")
-            cur = conn.cursor()
-            cur.execute("SELECT device_id FROM device_nodes")
-            for row in cur.fetchall():
-                processed.add(row[0])
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+            c.execute("SELECT device_id FROM device_nodes WHERE queue = 5")
+            for (did,) in c.fetchall():
+                processed.add(did)
             conn.close()
         except Exception:
             pass
     return processed
 
 
-IT_PATTERNS = ["switch", "router", "access point", "ap ", "poe", "sfp", " aggregator", "aggregation"]
-
-
-def is_likely_it(model: str, mfg: str) -> bool:
-    lower = model.lower()
-    for p in IT_PATTERNS:
-        if p in lower:
-            if "codec" in lower or "camera" in lower or "desk" in lower:
-                continue
-            return True
-    if mfg.lower() == "ubiquiti" and ("usw" in lower or ("unifi" in lower and "switch" in lower)):
-        return True
-    return False
+def load_d_tier_pool() -> list[dict]:
+    devices = []
+    for patch_file in PATCHES_DIR.rglob("*.patch"):
+        mfg_slug = patch_file.parent.name
+        if mfg_slug == "_uncategorized":
+            continue
+        text = patch_file.read_text(errors="replace")
+        meta = _parse_meta(text)
+        if meta.get("quality") != "D":
+            continue
+        devices.append({
+            "device_id": patch_file.stem,
+            "manufacturer": meta.get("manufacturer", ""),
+            "label": meta.get("model", ""),
+            "mfg_slug": mfg_slug,
+        })
+    return devices
 
 
 def select_replacements(
     count: int,
     manifest_db: Path,
     exclude_mfgs: dict[str, int] | None = None,
+    max_per_mfg: int = 3,
 ) -> list[dict]:
-    blacklist = load_blacklist()
-    processed = get_processed_ids(manifest_db)
-    pool = load_easyschematic_pool()
+    excluded = load_excluded()
+    processed = load_processed_from_dbs()
+    pool = load_d_tier_pool()
 
-    candidates = []
-    for d in pool:
-        mfg = d.get("manufacturer", "").strip()
-        label = d.get("label", "").strip()
-        if not mfg or mfg.lower() in ("unknown", "generic"):
-            continue
-        if is_likely_it(label, mfg):
-            continue
-        device_id = make_device_id(mfg, label)
-        if device_id in processed or device_id in blacklist:
-            continue
-        candidates.append(d)
+    candidates = [
+        d for d in pool
+        if d["device_id"] not in excluded and d["device_id"] not in processed
+    ]
 
     random.seed(int(datetime.now(timezone.utc).timestamp()))
     random.shuffle(candidates)
 
     selected = []
     mfg_counts = Counter(exclude_mfgs or {})
-    MAX_PER_MFG = 3
 
     for d in candidates:
-        mfg = d.get("manufacturer", "Unknown")
-        if mfg_counts[mfg] >= MAX_PER_MFG:
-            continue
-        device_id = make_device_id(mfg, d["label"])
-        selected.append({
-            "manufacturer": mfg,
-            "label": d["label"],
-            "device_id": device_id,
-        })
-        mfg_counts[mfg] += 1
         if len(selected) >= count:
             break
+        if mfg_counts[d["mfg_slug"]] >= max_per_mfg:
+            continue
+        selected.append(d)
+        mfg_counts[d["mfg_slug"]] += 1
 
     return selected
 
@@ -209,18 +199,24 @@ def main() -> int:
 
     print(f"Need {needed} replacement(s)")
 
-    # Blacklist correctly rejected devices
+    # Add pipeline-confirmed OOS devices to excluded.csv
+    existing_excluded = load_excluded()
     conn = sqlite3.connect(args.manifest)
     cur = conn.cursor()
     cur.execute("""
-        SELECT device_id, failure_message FROM device_nodes
+        SELECT device_id, manufacturer, model FROM device_nodes
         WHERE queue = 4 AND failure_category = 'OUT_OF_SCOPE'
     """)
-    for device_id, msg in cur.fetchall():
-        if device_id not in load_blacklist():
-            add_to_blacklist(device_id, msg or "OUT_OF_SCOPE")
-            print(f"  X {device_id} -> blacklist")
+    oos_rows = cur.fetchall()
     conn.close()
+    new_oos = [(did, mfg, model) for did, mfg, model in oos_rows if did not in existing_excluded]
+    if new_oos:
+        with EXCLUDED_CSV.open("a", newline="") as f:
+            writer = csv.writer(f)
+            for device_id, mfg, model in new_oos:
+                writer.writerow([device_id, mfg or "", model or "", "OOS"])
+                print(f"  X {device_id} -> excluded.csv (OOS)")
+
 
     # Count current manufacturer distribution from active devices
     conn = sqlite3.connect(args.manifest)
