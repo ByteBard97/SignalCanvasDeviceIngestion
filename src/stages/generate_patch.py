@@ -65,6 +65,36 @@ def _map_direction(direction: str | None) -> str:
     return "io"
 
 
+# Port name suffixes that unambiguously identify the signal type.
+# If a port name contains one of these tokens, the signal type is overridden
+# regardless of what the LLM extracted in attributes — the LLM frequently
+# copies the signal type from an adjacent port (e.g. DVI tagged as SDI).
+_NAME_SIGNAL_OVERRIDE: dict[str, str] = {
+    "dvi": "DVI",
+    "hdmi": "HDMI",
+    "displayport": "DisplayPort",
+    "_dp": "DisplayPort",
+    "vga": "VGA",
+    "sdi": "SDI",
+    "hdsdi": "HD-SDI",
+    "dante": "Dante",
+    "avb": "AVB",
+    "aes67": "AES67",
+    "madi": "MADI",
+    "aes": "AES",
+    "aes3": "AES3",
+}
+
+
+def _infer_signal_from_name(port_name: str) -> str | None:
+    """Return a corrected signal type if the port name unambiguously implies one."""
+    lower = port_name.lower()
+    for token, signal in _NAME_SIGNAL_OVERRIDE.items():
+        if token in lower:
+            return signal
+    return None
+
+
 # Map messy extracted connector strings to clean canonical names
 _CONNECTOR_CANON: dict[str, str] = {
     "1/4 trs": "TRS",
@@ -105,7 +135,14 @@ def _build_port_line(port: dict) -> str:
     direction = _map_direction(port.get("direction"))
     connector = _canonicalize_connector(port.get("connector"))
     channels = _parse_channels(port.get("channels"))
-    attrs = port.get("attributes")
+    attrs = list(port.get("attributes") or [])
+
+    # If the port name unambiguously implies a signal type, override LLM attributes.
+    # The LLM frequently copies the signal type from an adjacent port (e.g. DVI → SDI).
+    inferred = _infer_signal_from_name(port.get("name", ""))
+    if inferred:
+        attrs = [a for a in attrs if a.upper() not in {s.upper() for s in _NAME_SIGNAL_OVERRIDE.values()}]
+        attrs.insert(0, inferred)
 
     parts = [name]
     if channels is not None and channels > 1:
