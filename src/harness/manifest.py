@@ -141,6 +141,11 @@ class DeviceNode:
     pdf_url: Optional[str] = None
     pdf_path: Optional[str] = None
 
+    # Multi-candidate PDF URL tracking (JSON arrays)
+    candidate_pdf_urls: Optional[str] = None   # URLs Stage 1 found but haven't been tried yet
+    rejected_pdf_urls: Optional[str] = None    # URLs tried and confirmed bad (not a PDF)
+    pdf_kickback_count: int = 0                # times Stage 2 has kicked back to Stage 1
+
     # Ragscallion polling state
     ragscallion_job_id: Optional[str] = None
     ragscallion_submitted_at: Optional[str] = None
@@ -308,6 +313,9 @@ class Manifest:
                 ("canonical_sku", "TEXT"),
                 ("canonical_product_name", "TEXT"),
                 ("device_class", "TEXT"),
+                ("candidate_pdf_urls", "TEXT"),
+                ("rejected_pdf_urls", "TEXT"),
+                ("pdf_kickback_count", "INTEGER DEFAULT 0"),
             ]
             for col, ddl in migrations:
                 if col not in existing_cols:
@@ -461,6 +469,7 @@ class Manifest:
             node.queue, node.created_at, node.updated_at,
             node.stage_resolve_sku, node.canonical_sku, node.canonical_product_name,
             node.device_class,
+            node.candidate_pdf_urls, node.rejected_pdf_urls, node.pdf_kickback_count,
         )
 
     def _row_to_node(self, row: tuple) -> DeviceNode:
@@ -479,6 +488,7 @@ class Manifest:
             "queue", "created_at", "updated_at",
             "stage_resolve_sku", "canonical_sku", "canonical_product_name",
             "device_class",
+            "candidate_pdf_urls", "rejected_pdf_urls", "pdf_kickback_count",
         ]
         data = dict(zip(keys, row))
         # Convert SQLite booleans (0/1) to Python booleans
@@ -491,7 +501,7 @@ class Manifest:
         conn.execute("""
             INSERT OR REPLACE INTO device_nodes VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
         """, self._node_to_row(node))
 

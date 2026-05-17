@@ -62,6 +62,8 @@ EXTRACTION_TIMEOUT_SECONDS = 900  # Complex devices (matrix switchers, consoles)
 FIND_PDF_TIMEOUT_SECONDS = 120
 FIND_PDF_MAX_STEPS = 5  # tight budget; force fail-fast instead of broad exploration
 FIND_PDF_RETRY_ATTEMPTS = 2  # retry on empty Kimi output or model-mismatch URL
+PDF_CANDIDATES_PER_SEARCH = 3  # max URLs Stage 1 returns per Kimi call
+PDF_KICKBACK_MAX = 3  # max times Stage 2 may kick back to Stage 1 for new URLs
 RESOLVE_SKU_TIMEOUT_SECONDS = 180  # generous: alias lookup may need a few searches
 RESOLVE_SKU_MAX_STEPS = 8  # more breadth than Stage 1 — alias may map to several SKUs
 RESOLVE_SKU_SEMAPHORE = asyncio.Semaphore(3)
@@ -87,19 +89,18 @@ _MIN_PDF_SIZE_BYTES = 30 * 1024  # 30 KB
 
 
 def _build_find_pdf_prompt(manufacturer: str, model: str, exclude_urls: list[str]) -> str:
-    """Build the Stage 1 Kimi prompt, optionally excluding URLs from a previous attempt."""
+    """Build the Stage 1 Kimi prompt asking for up to 3 ranked PDF candidates."""
     base = (
         f'Web search for the official manufacturer datasheet PDF URL of '
         f'"{manufacturer} {model}". '
-        f'Do ONE web search, pick the best result that ends in .pdf, and reply '
-        f'with ONLY this JSON line: {{"pdf_url":"<url>"}}. '
-        f'If no PDF URL is in the search results, reply: {{"pdf_url":null}}. '
-        f'No commentary.'
+        f'Do ONE web search and return up to {PDF_CANDIDATES_PER_SEARCH} PDF URLs '
+        f'ranked best-first as JSON: {{"pdf_urls":["<best>","<second>","<third>"]}}. '
+        f'Include only real .pdf URLs you actually found. '
+        f'If none found, reply: {{"pdf_urls":[]}}. No commentary.'
     )
     if exclude_urls:
         base += (
-            f' The following URLs were already rejected as wrong-device or unreachable; '
-            f'do NOT return them: {json.dumps(exclude_urls)}.'
+            f' The following URLs previously failed; do NOT return them: {json.dumps(exclude_urls)}.'
         )
     return base
 
@@ -783,8 +784,9 @@ async def _find_spec_sheet_url(
                 manifest.persist(node)
                 return True
 
-        # Also blocklist-check any URL the agent finds later
-        rejected_urls: list[str] = []
+        # Seed rejected_urls from: (a) URLs Stage 2 confirmed are not PDFs, and
+        # (b) any blocklisted URL currently in node.pdf_url.
+        rejected_urls: list[str] = json.loads(node.rejected_pdf_urls or "[]")
         if _is_blocked_domain(node.pdf_url or ""):
             rejected_urls.append(node.pdf_url or "")
 
@@ -827,31 +829,49 @@ async def _find_spec_sheet_url(
                 last_failure_message = f"JSON parse error: {e}. Raw: {json_block[:500]}"
                 continue
 
-            pdf_url = data.get("pdf_url") if isinstance(data, dict) else None
-            if not pdf_url or not isinstance(pdf_url, str):
-                last_failure_message = f"Kimi JSON missing 'pdf_url' field. Raw: {json_block[:500]}"
+            # Accept both {"pdf_urls": [...]} (new) and {"pdf_url": "..."} (legacy).
+            if not isinstance(data, dict):
+                last_failure_message = f"Kimi returned non-dict JSON. Raw: {json_block[:500]}"
                 continue
+            if "pdf_urls" in data:
+                raw_candidates = data.get("pdf_urls") or []
+                if not isinstance(raw_candidates, list):
+                    raw_candidates = []
+            else:
+                single = data.get("pdf_url")
+                raw_candidates = [single] if single and isinstance(single, str) else []
 
-            pdf_url = pdf_url.strip()
-            if _is_blocked_domain(pdf_url):
-                last_failure_message = f"URL rejected (blocked domain): {pdf_url}"
-                rejected_urls.append(pdf_url)
-                continue
-
-            if not pdf_url.lower().endswith(".pdf"):
-                is_pdf = await _verify_pdf_content_type(pdf_url)
-                if not is_pdf:
-                    last_failure_message = f"URL does not end in .pdf and HEAD returned non-PDF: {pdf_url}"
-                    rejected_urls.append(pdf_url)
+            # Filter blocked domains and non-PDF URLs out of the candidate list.
+            valid_candidates: list[str] = []
+            for raw_url in raw_candidates:
+                if not raw_url or not isinstance(raw_url, str):
                     continue
+                url = raw_url.strip()
+                if _is_blocked_domain(url):
+                    rejected_urls.append(url)
+                    continue
+                if not url.lower().endswith(".pdf"):
+                    is_pdf = await _verify_pdf_content_type(url)
+                    if not is_pdf:
+                        rejected_urls.append(url)
+                        continue
+                valid_candidates.append(url)
 
+            if not valid_candidates:
+                last_failure_message = f"Kimi returned no usable PDF URLs (attempt {attempt})"
+                continue
+
+            pdf_url = valid_candidates[0]
+            extras = valid_candidates[1:]
             node.pdf_url = pdf_url
+            node.candidate_pdf_urls = json.dumps(extras) if extras else None
             node.stage_find_pdf = STAGE_COMPLETED
-            manifest.add_document(
-                node.device_id, DOC_TYPE_SPEC_SHEET, url=pdf_url
-            )
+            manifest.add_document(node.device_id, DOC_TYPE_SPEC_SHEET, url=pdf_url)
             manifest.persist(node)
-            logger.info(f"Device {node.device_id} PDF URL found (attempt {attempt}): {pdf_url}")
+            logger.info(
+                f"Device {node.device_id} PDF URL found (attempt {attempt}): {pdf_url}"
+                + (f" + {len(extras)} backup(s)" if extras else "")
+            )
             return True
 
         # Fallback: try DuckDuckGo direct search if Kimi CLI couldn't find anything.
@@ -1464,13 +1484,54 @@ async def stage_2_download_pdf(
                 return False
 
             if len(content) < 4 or content[:4] != b"%PDF":
-                _set_stage_failure(
-                    node,
-                    manifest,
-                    stage=STAGE_DOWNLOAD_PDF,
-                    category=FailureCategory.PDF_INVALID,
-                    message="Downloaded file is not a valid PDF (first 4 bytes != %PDF)",
-                    retryable=False,
+                tried_urls.append(current_url)
+                logger.warning(
+                    f"Device {node.device_id} URL is not a valid PDF: {current_url}"
+                )
+                # Persist bad URL to rejected list so Stage 1 won't re-suggest it.
+                existing_rejected = json.loads(node.rejected_pdf_urls or "[]")
+                if current_url not in existing_rejected:
+                    existing_rejected.append(current_url)
+                node.rejected_pdf_urls = json.dumps(existing_rejected)
+
+                # Try next candidate before giving up.
+                candidates = json.loads(node.candidate_pdf_urls or "[]")
+                if candidates:
+                    current_url = candidates.pop(0)
+                    node.candidate_pdf_urls = json.dumps(candidates) if candidates else None
+                    node.pdf_url = current_url
+                    manifest.persist(node)
+                    logger.info(f"Device {node.device_id} trying next candidate: {current_url}")
+                    continue
+
+                # All candidates exhausted — kick back to Stage 1 for a fresh search.
+                if node.pdf_kickback_count >= PDF_KICKBACK_MAX:
+                    _set_stage_failure(
+                        node,
+                        manifest,
+                        stage=STAGE_DOWNLOAD_PDF,
+                        category=FailureCategory.PDF_INVALID,
+                        message=(
+                            f"All {node.pdf_kickback_count} Stage 1 searches exhausted "
+                            f"({len(existing_rejected)} URLs tried, none valid PDFs)"
+                        ),
+                        retryable=False,
+                    )
+                    return False
+
+                node.pdf_kickback_count += 1
+                node.stage_find_pdf = STAGE_NOT_STARTED
+                node.stage_download_pdf = STAGE_NOT_STARTED
+                node.pdf_url = None
+                node.candidate_pdf_urls = None
+                node.failure_category = FailureCategory.PDF_INVALID.value
+                node.failure_retryable = True
+                node.failure_at = datetime.now(timezone.utc).isoformat()
+                manifest.persist(node)
+                logger.info(
+                    f"Device {node.device_id} kicked back to Stage 1 "
+                    f"(kickback #{node.pdf_kickback_count}, "
+                    f"{len(existing_rejected)} rejected URL(s))"
                 )
                 return False
 
