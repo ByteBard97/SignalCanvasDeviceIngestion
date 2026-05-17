@@ -89,14 +89,14 @@ _MIN_PDF_SIZE_BYTES = 30 * 1024  # 30 KB
 
 
 def _build_find_pdf_prompt(manufacturer: str, model: str, exclude_urls: list[str]) -> str:
-    """Build the Stage 1 Kimi prompt asking for up to 3 ranked PDF candidates."""
+    """Build the Stage 1 Kimi prompt asking for spec sheet + supplementary docs."""
     base = (
-        f'Web search for the official manufacturer datasheet PDF URL of '
-        f'"{manufacturer} {model}". '
-        f'Do ONE web search and return up to {PDF_CANDIDATES_PER_SEARCH} PDF URLs '
-        f'ranked best-first as JSON: {{"pdf_urls":["<best>","<second>","<third>"]}}. '
-        f'Include only real .pdf URLs you actually found. '
-        f'If none found, reply: {{"pdf_urls":[]}}. No commentary.'
+        f'Web search for PDFs for the "{manufacturer} {model}". '
+        f'Find up to {PDF_CANDIDATES_PER_SEARCH} PDFs: the official datasheet/spec sheet '
+        f'MUST be first, then optionally the user manual and/or install guide. '
+        f'Return as JSON: {{"docs":[{{"url":"<url>","doc_type":"spec_sheet|user_manual|install_guide"}}]}}. '
+        f'First entry must be the spec sheet. Include only real .pdf URLs you found. '
+        f'If none found, reply: {{"docs":[]}}. No commentary.'
     )
     if exclude_urls:
         base += (
@@ -829,24 +829,47 @@ async def _find_spec_sheet_url(
                 last_failure_message = f"JSON parse error: {e}. Raw: {json_block[:500]}"
                 continue
 
-            # Accept both {"pdf_urls": [...]} (new) and {"pdf_url": "..."} (legacy).
+            # Parse {"docs": [{"url": "...", "doc_type": "..."}]} (new),
+            # {"pdf_urls": [...]} (previous multi-candidate), or
+            # {"pdf_url": "..."} (legacy single-URL).
             if not isinstance(data, dict):
                 last_failure_message = f"Kimi returned non-dict JSON. Raw: {json_block[:500]}"
                 continue
-            if "pdf_urls" in data:
-                raw_candidates = data.get("pdf_urls") or []
-                if not isinstance(raw_candidates, list):
-                    raw_candidates = []
+
+            _VALID_DOC_TYPES = {DOC_TYPE_SPEC_SHEET, DOC_TYPE_USER_MANUAL, DOC_TYPE_INSTALL_GUIDE}
+            if "docs" in data:
+                raw_docs = data.get("docs") or []
+                if not isinstance(raw_docs, list):
+                    raw_docs = []
+                # Position 0 is always spec_sheet regardless of Kimi's label.
+                raw_entries = []
+                for i, entry in enumerate(raw_docs):
+                    if not isinstance(entry, dict):
+                        continue
+                    url = entry.get("url", "")
+                    if not url or not isinstance(url, str):
+                        continue
+                    doc_type = entry.get("doc_type", DOC_TYPE_USER_MANUAL)
+                    if doc_type not in _VALID_DOC_TYPES:
+                        doc_type = DOC_TYPE_USER_MANUAL
+                    if i == 0:
+                        doc_type = DOC_TYPE_SPEC_SHEET
+                    raw_entries.append((url.strip(), doc_type))
+            elif "pdf_urls" in data:
+                raw_list = data.get("pdf_urls") or []
+                raw_entries = [
+                    (u.strip(), DOC_TYPE_SPEC_SHEET)
+                    for u in raw_list
+                    if u and isinstance(u, str)
+                ]
             else:
                 single = data.get("pdf_url")
-                raw_candidates = [single] if single and isinstance(single, str) else []
+                raw_entries = [(single.strip(), DOC_TYPE_SPEC_SHEET)] if single and isinstance(single, str) else []
 
-            # Filter blocked domains and non-PDF URLs out of the candidate list.
-            valid_candidates: list[str] = []
-            for raw_url in raw_candidates:
-                if not raw_url or not isinstance(raw_url, str):
-                    continue
-                url = raw_url.strip()
+            # Filter blocked/non-PDF URLs; track spec_sheet separately from supplements.
+            spec_sheet_urls: list[str] = []
+            supplement_entries: list[tuple[str, str]] = []
+            for url, doc_type in raw_entries:
                 if _is_blocked_domain(url):
                     rejected_urls.append(url)
                     continue
@@ -855,22 +878,33 @@ async def _find_spec_sheet_url(
                     if not is_pdf:
                         rejected_urls.append(url)
                         continue
-                valid_candidates.append(url)
+                if doc_type == DOC_TYPE_SPEC_SHEET:
+                    spec_sheet_urls.append(url)
+                else:
+                    supplement_entries.append((url, doc_type))
 
-            if not valid_candidates:
-                last_failure_message = f"Kimi returned no usable PDF URLs (attempt {attempt})"
+            if not spec_sheet_urls:
+                last_failure_message = f"Kimi returned no usable spec sheet URL (attempt {attempt})"
                 continue
 
-            pdf_url = valid_candidates[0]
-            extras = valid_candidates[1:]
-            node.pdf_url = pdf_url
-            node.candidate_pdf_urls = json.dumps(extras) if extras else None
+            # Primary spec sheet (gates queue progression).
+            primary_url = spec_sheet_urls[0]
+            backup_spec_sheets = spec_sheet_urls[1:]
+            node.pdf_url = primary_url
+            node.candidate_pdf_urls = json.dumps(backup_spec_sheets) if backup_spec_sheets else None
             node.stage_find_pdf = STAGE_COMPLETED
-            manifest.add_document(node.device_id, DOC_TYPE_SPEC_SHEET, url=pdf_url)
+            manifest.add_document(node.device_id, DOC_TYPE_SPEC_SHEET, url=primary_url)
+
+            # Supplementary docs (user manual, install guide) — best-effort.
+            for supp_url, supp_type in supplement_entries:
+                manifest.add_document(node.device_id, supp_type, url=supp_url)
+                logger.info(f"Device {node.device_id}: queued {supp_type} for download: {supp_url}")
+
             manifest.persist(node)
             logger.info(
-                f"Device {node.device_id} PDF URL found (attempt {attempt}): {pdf_url}"
-                + (f" + {len(extras)} backup(s)" if extras else "")
+                f"Device {node.device_id} spec sheet found (attempt {attempt}): {primary_url}"
+                + (f" + {len(backup_spec_sheets)} spec backup(s)" if backup_spec_sheets else "")
+                + (f" + {len(supplement_entries)} supplement(s)" if supplement_entries else "")
             )
             return True
 
