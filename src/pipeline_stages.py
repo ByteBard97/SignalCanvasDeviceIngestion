@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from send2trash import send2trash as _send2trash
+
 from .harness.manifest import (
     DeviceNode,
     Manifest,
@@ -1748,6 +1750,23 @@ def _set_stage_failure(
     logger.warning(f"Device {node.device_id} stage {stage} failed: {category.value} — {message}")
 
 
+def _trash_local_file(path_str: Optional[str], context: str) -> None:
+    """Move a local file to trash after it has been uploaded to Ragscallion.
+
+    Manifest must be updated (local_path = NULL) before calling this so a
+    crash between the two leaves the DB in a consistent state.
+    """
+    if not path_str:
+        return
+    try:
+        p = Path(path_str)
+        if p.exists():
+            _send2trash(str(p))
+            logger.info(f"{context}: trashed local file {p}")
+    except Exception as e:
+        logger.warning(f"{context}: failed to trash {path_str}: {e}")
+
+
 async def stage_3_4_submit_to_ragscallion(
     node: DeviceNode,
     ragscallion_client: RagscallionClient,
@@ -1801,6 +1820,13 @@ async def stage_3_4_submit_to_ragscallion(
             f"Device {node.device_id} spec_sheet submitted to Ragscallion, job_id={job['job_id']}"
         )
 
+        # Null DB references before trashing so a crash leaves a consistent state.
+        if spec_doc:
+            manifest.clear_document_local_path(spec_doc.id)
+        manifest.clear_node_pdf_path(node.device_id)
+        node.pdf_path = None
+        _trash_local_file(spec_local_path, f"Device {node.device_id} spec_sheet")
+
         await _submit_secondary_docs(node, ragscallion_client, manifest, corpus_id)
         return True
 
@@ -1828,6 +1854,11 @@ async def stage_3_4_submit_to_ragscallion(
             logger.info(
                 f"Device {node.device_id} spec_sheet re-submitted to Ragscallion (replace), job_id={job['job_id']}"
             )
+            if spec_doc:
+                manifest.clear_document_local_path(spec_doc.id)
+            manifest.clear_node_pdf_path(node.device_id)
+            node.pdf_path = None
+            _trash_local_file(spec_local_path, f"Device {node.device_id} spec_sheet (replace)")
             await _submit_secondary_docs(node, ragscallion_client, manifest, corpus_id)
             return True
         except Exception as retry_e:
@@ -1937,6 +1968,8 @@ async def _submit_secondary_docs(
             f"Device {node.device_id}: {doc.doc_type} submitted to Ragscallion, "
             f"job_id={job['job_id']}"
         )
+        manifest.clear_document_local_path(doc.id)
+        _trash_local_file(doc.local_path, f"Device {node.device_id} {doc.doc_type}")
 
 
 async def stage_5_extract_specs(

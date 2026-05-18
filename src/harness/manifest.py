@@ -817,6 +817,24 @@ class Manifest:
             )
             conn.commit()
 
+    def clear_document_local_path(self, doc_id: int) -> None:
+        """Null out local_path for a document after the file has been trashed."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE device_documents SET local_path = NULL WHERE id = ?",
+                (doc_id,),
+            )
+            conn.commit()
+
+    def clear_node_pdf_path(self, device_id: str) -> None:
+        """Null out pdf_path on the device node after the file has been trashed."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE device_nodes SET pdf_path = NULL WHERE device_id = ?",
+                (device_id,),
+            )
+            conn.commit()
+
 
 # Backwards-compatibility alias for existing code
 IngestionManifest = Manifest
