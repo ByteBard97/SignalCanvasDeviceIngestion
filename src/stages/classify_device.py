@@ -47,6 +47,14 @@ RULE_TABLE: list[tuple[str, str, str]] = [
     # Cisco AV codecs and cameras (in scope) — must come before IT rules
     # so the LLM never sees them and misclassifies based on brand bias
     (r"Cisco", r"Codec.*|CS-CPRO.*|CS-CODEC.*|SX.*|MX.*|Room\s*Kit.*|Room\s*Bar.*|Room\s*Navigator.*|Webex.*|Precision.*|SpeakerTrack.*|TelePresence.*|P40.*|P60.*|Desk.*", "codec"),
+    # Protocol converters, embedders, distribution amps — fixed hardwired signal path
+    # Match on model name keywords before any brand-level rules fire
+    (r".*", r".*\b(SDI.to.NDI|NDI.to.SDI|SDI.to.HDMI|HDMI.to.SDI|SDI.to.IP|IP.to.SDI"
+             r"|analog.to.dante|dante.to.analog|MADI.to.Dante|Dante.to.MADI"
+             r"|AES.to.Dante|Dante.to.AES|fiber.to.SDI|SDI.to.fiber)\b.*", "converter"),
+    (r".*", r".*\b(embedder|de.embedder|disembedder|re.clocker|reclocker"
+             r"|frame.sync(hronizer)?|distribution.amp(lifier)?|DA\d|transcoder"
+             r"|ProConvert|FrameSync|MultiSync)\b.*", "converter"),
     # Confirmed AV brands that the LLM might misclassify due to brand association —
     # must come before any it_networking catch-alls
     (r"LynxTechnik|Lynx.Technik", r".*", "generic"),
@@ -153,6 +161,7 @@ VALID_CLASSES = {
     "wireless_rx",
     "mixing_console",
     "dsp_processor",
+    "converter",
     "it_networking",
     "generic",
 }
@@ -186,7 +195,7 @@ _CLASSIFICATION_SYSTEM_PROMPT = (
     "and explicitly does NOT document IT/networking infrastructure.\n\n"
     "Given a manufacturer and model, emit exactly one classification token from this list:\n"
     "dante_stagebox, dante_adapter_input, dante_adapter_output, "
-    "wireless_rx, mixing_console, dsp_processor, it_networking, generic\n\n"
+    "wireless_rx, mixing_console, dsp_processor, converter, it_networking, generic\n\n"
     "CLASS DEFINITIONS:\n"
     "- dante_stagebox: A box whose primary purpose is bridging Audinate Dante network audio to "
     "analogue/AES/MADI, with many I/O channels (e.g. Yamaha Rio, Focusrite RedNet, Luminex LumiNode). "
@@ -198,9 +207,15 @@ _CLASSIFICATION_SYSTEM_PROMPT = (
     "- wireless_rx: A wireless microphone or IEM receiver (e.g. Shure ULXD4, Sennheiser EW-DX EM).\n"
     "- mixing_console: A hardware audio mixing console.\n"
     "- dsp_processor: A dedicated DSP signal processor (e.g. QSC Core, Biamp Tesira, BSS Audio).\n"
+    "- converter: A device with a FIXED, hardwired signal path between two protocols — the signal "
+    "always flows from input to output regardless of configuration. Examples: SDI→NDI converters, "
+    "HDMI→SDI converters, analog→Dante adapters, audio embedders/de-embedders, distribution amps, "
+    "re-clockers, frame synchronizers, protocol gateways. If the device name contains 'converter', "
+    "'embedder', 'de-embedder', 'distribution amp', 're-clocker', or 'X to Y' (two protocols), "
+    "use 'converter'.\n"
     "- it_networking: Switches, routers, firewalls, access points, NAS/storage — IT infrastructure.\n"
-    "- generic: Everything else — cameras, projectors, displays, speakers, amplifiers, recorders, "
-    "intercoms, video converters, NDI devices, AVB devices, AES67 devices, USB audio interfaces, "
+    "- generic: Everything else — cameras, projectors, displays, speakers, mixers, amplifiers, "
+    "recorders, intercoms, NDI devices, AVB devices, AES67 devices, USB audio interfaces, "
     "power amplifiers, passive speakers, or any device you are not certain fits a specific class.\n\n"
     "CRITICAL: Only use dante_stagebox/dante_adapter_input/dante_adapter_output if you are CERTAIN "
     "the device uses Audinate Dante. When in doubt, use 'generic'.\n\n"

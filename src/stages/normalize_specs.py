@@ -89,7 +89,94 @@ _BRIDGE_HEURISTICS: dict[str, list[tuple[str, str]]] = {
     ],
     "mixing_console": [],
     "dsp_processor": [],
+    # converter bridges are inferred from port structure — see _infer_converter_bridges
+    "converter": [],
 }
+
+# Signal type tokens that indicate a professional AV protocol — used for
+# converter bridge inference.  Order matters: more specific first.
+_SIGNAL_PROTOCOL_TOKENS: list[tuple[str, str]] = [
+    ("dante", "Dante"),
+    ("ndi", "NDI"),
+    ("madi", "MADI"),
+    ("aes67", "AES67"),
+    ("aes3", "AES3"),
+    ("aes", "AES"),
+    ("avb", "AVB"),
+    ("milan", "Milan"),
+    ("ravenna", "Ravenna"),
+    ("sdi", "SDI"),
+    ("hd-sdi", "SDI"),
+    ("hdbaset", "HDBaseT"),
+    ("hdmi", "HDMI"),
+    ("displayport", "DisplayPort"),
+    ("genlock", "Genlock"),
+    ("timecode", "Timecode"),
+    ("analog", "Analog"),
+    ("analogue", "Analog"),
+]
+
+# Port name/attr tokens that disqualify a port from converter bridge inference
+_NON_SIGNAL_TOKENS = {
+    "power", "mains", "iec", "gpio", "gpi", "gpo", "rs232", "rs422",
+    "rs485", "usb", "ethernet", "network", "control", "management",
+    "wordclock", "word clock", "loop", "thru", "through",
+}
+
+
+def _port_protocol(port: dict) -> str | None:
+    """Extract the dominant AV signal protocol from a port's name and attributes."""
+    name = (port.get("name") or "").lower()
+    attrs = " ".join(str(a) for a in (port.get("attributes") or [])).lower()
+    combined = f"{name} {attrs}"
+    for token, canonical in _SIGNAL_PROTOCOL_TOKENS:
+        if token in combined:
+            return canonical
+    return None
+
+
+def _is_non_signal_port(port: dict) -> bool:
+    name = (port.get("name") or "").lower()
+    attrs = " ".join(str(a) for a in (port.get("attributes") or [])).lower()
+    combined = f"{name} {attrs}"
+    return any(t in combined for t in _NON_SIGNAL_TOKENS)
+
+
+def _infer_converter_bridges(ports: list[dict]) -> list[str]:
+    """Infer bridge statements from port structure.
+
+    Covers two patterns:
+      - Protocol conversion: all inputs are protocol A, all outputs are protocol B (A≠B)
+        → bridge first_input -> first_output
+      - Distribution amp: one input, N outputs of the same protocol
+        → bridge input -> first_output  (one bridge summarises the fan-out)
+    """
+    signal_ports = [p for p in ports if isinstance(p, dict) and not _is_non_signal_port(p)]
+
+    in_ports = [p for p in signal_ports if (p.get("direction") or "").lower() in ("input", "in")]
+    out_ports = [p for p in signal_ports if (p.get("direction") or "").lower() in ("output", "out")]
+
+    if not in_ports or not out_ports:
+        return []
+
+    in_protos = {_port_protocol(p) for p in in_ports} - {None}
+    out_protos = {_port_protocol(p) for p in out_ports} - {None}
+
+    if not in_protos or not out_protos:
+        return []
+
+    in_name = in_ports[0].get("name", "Input")
+    out_name = out_ports[0].get("name", "Output")
+
+    # Protocol conversion: clear A→B mapping
+    if in_protos != out_protos and len(in_protos) == 1 and len(out_protos) == 1:
+        return [f"{in_name} -> {out_name}"]
+
+    # Distribution amp: one input protocol, same protocol on outputs, more outputs than inputs
+    if in_protos == out_protos and len(in_ports) == 1 and len(out_ports) > 1:
+        return [f"{in_name} -> {out_name}"]
+
+    return []
 
 _CONNECTOR_INFERENCES: list[tuple[str, str]] = [
     ("XLR", r"\bXLR\b"),
@@ -599,6 +686,13 @@ def apply_bridge_heuristics(extracted: dict, device_class: str) -> dict:
 
     heuristics = _BRIDGE_HEURISTICS[device_class]
     new_bridges: list[str] = []
+
+    # converter class: use port-structure inference instead of name patterns
+    if device_class == "converter":
+        inferred = _infer_converter_bridges(ports)
+        if inferred:
+            signal_flow["bridges"] = inferred
+        return extracted
 
     for src_pat, dst_pat in heuristics:
         src_port = None

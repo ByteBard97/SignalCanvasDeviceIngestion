@@ -239,7 +239,7 @@ async def _run_scope_check(nodes: list[DeviceNode], manifest: Manifest) -> list[
         AV_DEVICE_TYPES = {
             "codec", "av-over-ip", "dsp", "mixer", "speaker", "camera",
             "wireless_rx", "dante_stagebox", "dante_adapter_input",
-            "dante_adapter_output", "switcher", "router", "matrix",
+            "dante_adapter_output", "converter", "switcher", "router", "matrix",
             "processor", "recorder", "player", "monitor", "display",
             "projector", "microphone", "headset", "intercom", "stagebox",
         }
