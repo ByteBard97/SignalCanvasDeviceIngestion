@@ -47,6 +47,21 @@ RULE_TABLE: list[tuple[str, str, str]] = [
     # Cisco AV codecs and cameras (in scope) — must come before IT rules
     # so the LLM never sees them and misclassifies based on brand bias
     (r"Cisco", r"Codec.*|CS-CPRO.*|CS-CODEC.*|SX.*|MX.*|Room\s*Kit.*|Room\s*Bar.*|Room\s*Navigator.*|Webex.*|Precision.*|SpeakerTrack.*|TelePresence.*|P40.*|P60.*|Desk.*", "codec"),
+    # Confirmed AV brands that the LLM might misclassify due to brand association —
+    # must come before any it_networking catch-alls
+    (r"LynxTechnik|Lynx.Technik", r".*", "generic"),
+    (r"AJA", r".*", "generic"),
+    (r"Ross.Video|Ross", r".*", "generic"),
+    (r"Blackmagic.Design|Blackmagic", r".*", "generic"),
+    (r"AVMATRIX|AVMatrix", r".*", "generic"),
+    (r"AVPro.Edge|AVPro", r".*MXnet.*|.*MX.NET.*|.*SW\d+.*", "generic"),
+    (r"Crestron", r".*", "generic"),
+    # Ubiquiti Enterprise AV Fiber — SMPTE 2110 AV-over-IP switch, not a standard Ubiquiti IT switch
+    (r"Ubiquiti", r".*Enterprise.*AV.*|.*EAV.*", "generic"),
+    # ELC lighting/DMX nodes — DMX-over-IP is a legitimate AV signal protocol
+    (r"ELC", r".*", "generic"),
+    # Encore/Clear-Com intercom wall panels — intercom is an AV signal type
+    (r"Encore.*Pullman|Encore", r".*Wall.*Plate.*|.*Intercom.*|.*Ops.*", "generic"),
     # IT / Networking — explicitly out of scope for SignalCanvas
     (r"Cisco", r"SF.*|Catalyst.*|Nexus.*|ISR.*|ASA.*|Meraki.*|SG.*|CBS.*", "it_networking"),
     (r"Ubiquiti", r"USW.*|UDM.*|USG.*|EdgeRouter.*|EdgeSwitch.*|UAP.*", "it_networking"),

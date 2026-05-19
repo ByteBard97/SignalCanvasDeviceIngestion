@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import logging
 import re
@@ -62,6 +63,12 @@ STAGE_COMPLETED = 2
 STAGE_FAILED = 3
 
 logger = logging.getLogger(__name__)
+
+_EXCLUDED_CSV = (
+    Path(__file__).resolve().parent.parent.parent
+    / "SignalCanvasDeviceLibrary"
+    / "excluded.csv"
+)
 
 # Wall-clock hard cap (minutes)
 HARD_CAP_MINUTES = 360
@@ -278,6 +285,7 @@ async def _run_scope_check(nodes: list[DeviceNode], manifest: Manifest) -> list[
             node.failure_at = datetime.now(timezone.utc).isoformat()
             node.queue = QUEUE_4_MANUAL_REVIEW
             manifest.persist(node)
+            _append_to_excluded_csv(node)
         else:
             kept.append(node)
 
@@ -285,6 +293,22 @@ async def _run_scope_check(nodes: list[DeviceNode], manifest: Manifest) -> list[
     if rejected:
         logger.info(f"Scope check: {rejected} device(s) rejected as out-of-scope")
     return kept
+
+
+def _append_to_excluded_csv(node: DeviceNode) -> None:
+    """Append a pipeline-rejected device to excluded.csv so it is never re-selected."""
+    if not _EXCLUDED_CSV.exists():
+        logger.warning(f"excluded.csv not found at {_EXCLUDED_CSV} — skipping auto-exclude")
+        return
+    # Check if already present to avoid duplicates
+    with _EXCLUDED_CSV.open(newline="") as f:
+        existing = {row["device_id"].strip() for row in csv.DictReader(f)}
+    if node.device_id in existing:
+        return
+    with _EXCLUDED_CSV.open("a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([node.device_id, node.manufacturer, node.model, "CIT"])
+    logger.info(f"Auto-excluded {node.device_id} → excluded.csv (CIT)")
 
 
 def _run_patchify_fast_path(
