@@ -58,8 +58,9 @@ RULE_TABLE: list[tuple[str, str, str]] = [
     (r"Crestron", r".*", "generic"),
     # Ubiquiti Enterprise AV Fiber — SMPTE 2110 AV-over-IP switch, not a standard Ubiquiti IT switch
     (r"Ubiquiti", r".*Enterprise.*AV.*|.*EAV.*", "generic"),
-    # ELC lighting/DMX nodes — DMX-over-IP is a legitimate AV signal protocol
+    # ELC and DMXTranscension — DMX lighting control, not Dante
     (r"ELC", r".*", "generic"),
+    (r"DMXTranscension|DMX.Transcension", r".*", "generic"),
     # Encore/Clear-Com intercom wall panels — intercom is an AV signal type
     (r"Encore.*Pullman|Encore", r".*Wall.*Plate.*|.*Intercom.*|.*Ops.*", "generic"),
     # IT / Networking — explicitly out of scope for SignalCanvas
@@ -203,6 +204,8 @@ _CLASSIFICATION_SYSTEM_PROMPT = (
     "power amplifiers, passive speakers, or any device you are not certain fits a specific class.\n\n"
     "CRITICAL: Only use dante_stagebox/dante_adapter_input/dante_adapter_output if you are CERTAIN "
     "the device uses Audinate Dante. When in doubt, use 'generic'.\n\n"
+    "IMPORTANT: DMX512 (stage lighting control) is NOT Dante and NOT audio networking. "
+    "DMX dimmers, relay controllers, and lighting nodes are always 'generic'.\n\n"
     "IMPORTANT: Some manufacturers make both AV and IT products. Classify based on the specific model.\n"
     "Respond with ONLY the token, no punctuation or explanation."
 )
