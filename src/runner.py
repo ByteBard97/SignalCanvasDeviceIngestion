@@ -896,6 +896,14 @@ async def run_pipeline(
         await ragscallion_client.close()
 
     _print_summary(manifest)
+    _write_done_sentinel(manifest_db)
+
+
+def _write_done_sentinel(manifest_db: Path) -> None:
+    """Write a .done sentinel file next to the manifest so watchers can detect completion."""
+    sentinel = manifest_db.with_suffix(".done")
+    sentinel.write_text("")
+    logger.info(f"Wrote sentinel: {sentinel}")
 
 
 def main_cli() -> None:
