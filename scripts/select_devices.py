@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select N random D-tier devices from the library for pipeline processing.
+"""Select N D-tier devices from the library for pipeline processing.
 
 Reads:
     SignalCanvasDeviceLibrary/patches/   — source of D-tier devices
@@ -10,9 +10,9 @@ Writes:
     <output-file>  (pipe-separated: manufacturer|model|device_id)
 
 Usage:
-    .venv/bin/python scripts/select_devices.py --n 200 --out my_batch.txt
-    .venv/bin/python scripts/select_devices.py --n 100 --max-per-mfg 3 --seed 42 --out my_batch.txt
-    .venv/bin/python scripts/select_devices.py --n 50 --dry-run
+    .venv/bin/python scripts/select_devices.py --n 20 --out my_batch.txt
+    .venv/bin/python scripts/select_devices.py --n 20 --prioritize --out my_batch.txt
+    .venv/bin/python scripts/select_devices.py --n 20 --prioritize --dry-run
 """
 
 from __future__ import annotations
@@ -33,6 +33,29 @@ EXCLUDED_CSV = LIBRARY_ROOT / "excluded.csv"
 OUTPUT_DIR = REPO_ROOT / "output"
 
 VALID_REASON_CODES = {"CIT", "OOS", "DUP", "DSC", "NDS"}
+
+# Manufacturers known to produce core professional AV gear (+2 score each)
+PRIORITY_MANUFACTURERS: set[str] = {
+    "yamaha", "shure", "sennheiser", "qsc", "allen-heath", "allen_heath",
+    "focusrite", "blackmagic-design", "blackmagic_design", "digico", "avid",
+    "soundcraft", "behringer", "presonus", "midas", "ssl", "neve",
+    "audinate", "luminex", "dante", "biamp", "bss", "crown", "lab-gruppen",
+    "lab_gruppen", "powersoft", "meyer-sound", "meyer_sound", "d-b",
+    "clear-com", "clear_com", "riedel", "rts", "green-go", "green_go",
+    "ross-video", "ross_video", "sony", "panasonic", "jvc", "canon",
+    "aja", "blackmagic", "atomos", "decimator", "magewell", "teradek",
+    "vizio", "ndi", "vizrt", "newtek", "grass-valley", "grass_valley",
+    "nevion", "harmonic", "generic-dante", "extron", "crestron", "kramer",
+    "atlona", "lightware", "barco", "christie", "nec", "epson",
+}
+
+# Signal types that indicate a professional AV protocol (+1 score per unique hit)
+PRIORITY_SIGNALS: set[str] = {
+    "dante", "madi", "sdi", "aes67", "aes70", "oca", "ndi", "avb", "milan",
+    "aes3", "ravenna", "ember", "nmos", "qsys", "q-sys", "hdbaset",
+    "displayport", "genlock", "wordclock", "timecode", "ltc", "vitc",
+    "rs422", "rs232",
+}
 
 _META_FIELD_RE = re.compile(r'(\w+):\s*"([^"]*)"')
 
@@ -87,6 +110,25 @@ def load_processed(output_dir: Path) -> set[str]:
     return processed
 
 
+def _priority_score(patch_text: str, mfg_slug: str) -> int:
+    """Score a device for triage prioritization.
+
+    +2  manufacturer is in the known pro-AV tier
+    +1  per unique professional signal type found in port attributes
+    """
+    score = 0
+    if mfg_slug.lower() in PRIORITY_MANUFACTURERS:
+        score += 2
+    found_signals: set[str] = set()
+    for attr_block in re.findall(r'\[([^\]]+)\]', patch_text):
+        for token in attr_block.split(","):
+            t = token.strip().lower()
+            if t in PRIORITY_SIGNALS:
+                found_signals.add(t)
+    score += len(found_signals)
+    return score
+
+
 def load_d_tier_devices(patches_dir: Path) -> list[dict]:
     """Return all D-tier devices from patches/ as list of dicts."""
     devices = []
@@ -106,6 +148,7 @@ def load_d_tier_devices(patches_dir: Path) -> list[dict]:
             "manufacturer": manufacturer,
             "model": model,
             "mfg_slug": mfg_slug,
+            "priority_score": _priority_score(text, mfg_slug),
         })
     return devices
 
@@ -117,11 +160,18 @@ def select(
     n: int,
     max_per_mfg: int | None,
     seed: int | None,
+    prioritize: bool = False,
 ) -> list[dict]:
     rng = random.Random(seed)
 
     pool = [d for d in devices if d["device_id"] not in excluded and d["device_id"] not in processed]
-    rng.shuffle(pool)
+
+    if prioritize:
+        # Sort by score descending, break ties randomly
+        rng.shuffle(pool)
+        pool.sort(key=lambda d: d.get("priority_score", 0), reverse=True)
+    else:
+        rng.shuffle(pool)
 
     selected = []
     mfg_counts: Counter = Counter()
@@ -145,6 +195,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--out", type=Path, default=None, help="Output batch file path")
     parser.add_argument("--dry-run", action="store_true", help="Print selection without writing")
+    parser.add_argument("--prioritize", action="store_true", help="Score and rank by pro-AV manufacturer tier and protocol presence")
     args = parser.parse_args()
 
     if not PATCHES_DIR.exists():
@@ -166,12 +217,14 @@ def main() -> int:
     eligible = len([d for d in devices if d["device_id"] not in excluded and d["device_id"] not in processed])
     print(f"  {eligible} eligible for selection")
 
-    selected = select(devices, excluded, processed, args.n, args.max_per_mfg, args.seed)
+    selected = select(devices, excluded, processed, args.n, args.max_per_mfg, args.seed, args.prioritize)
     print(f"\nSelected {len(selected)} devices")
 
     if args.dry_run:
         for d in selected:
-            print(f"  {d['device_id']}  ({d['manufacturer']} {d['model']})")
+            score = d.get("priority_score", 0)
+            score_str = f"  [score={score}]" if args.prioritize else ""
+            print(f"  {d['device_id']}  ({d['manufacturer']} {d['model']}){score_str}")
         return 0
 
     if args.out is None:
