@@ -57,6 +57,7 @@ from .stages.normalize_specs import normalize_extraction
 from .stages.validate_patch import validate_patch
 from .stages.classify_device import classify
 from .stages.combined_device_context import get_combined_context
+from .recovery import recovery_router
 
 # Stage status constants reused from pipeline_stages
 STAGE_COMPLETED = 2
@@ -757,6 +758,15 @@ async def run_pipeline(
     if not nodes:
         logger.warning("All devices were rejected as out-of-scope")
         return
+
+    # Self-healing: attempt recovery on non-retryable failed nodes before fast-path
+    recovered_nodes = []
+    for node in nodes:
+        if node.failure_category is not None and not node.failure_retryable:
+            if await recovery_router(node, manifest):
+                recovered_nodes.append(node.device_id)
+    if recovered_nodes:
+        logger.info(f"Recovery router reset {len(recovered_nodes)} device(s): {', '.join(recovered_nodes)}")
 
     # Fast-path: generate specs directly from patchify inputs/outputs when available.
     patchify_fast_nodes = _run_patchify_fast_path(nodes, manifest)

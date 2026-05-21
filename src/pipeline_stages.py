@@ -1844,7 +1844,7 @@ async def stage_3_4_submit_to_ragscallion(
             node.failure_stage = STAGE_INDEX_RAG
             node.failure_category = FailureCategory.RAGDB_COLLISION.value
             node.failure_message = f"Collision retry failed: {retry_e}"
-            node.failure_retryable = False
+            node.failure_retryable = True
             node.failure_attempts += 1
             node.failure_at = datetime.now(timezone.utc).isoformat()
             node.queue = QUEUE_4_MANUAL_REVIEW
@@ -1872,7 +1872,7 @@ async def stage_3_4_submit_to_ragscallion(
         node.failure_stage = STAGE_INDEX_RAG
         node.failure_category = FailureCategory.RAGDB_SUBMISSION_ERROR.value
         node.failure_message = str(e)
-        node.failure_retryable = False
+        node.failure_retryable = True
         node.failure_attempts += 1
         node.failure_at = datetime.now(timezone.utc).isoformat()
         node.queue = QUEUE_4_MANUAL_REVIEW
