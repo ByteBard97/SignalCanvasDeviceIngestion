@@ -11,6 +11,7 @@ from .harness.manifest import (
     DOC_TYPE_SPEC_SHEET,
 )
 from .ragscallion_client import RagscallionClient
+from .harness.manifest import _trash_local_file
 
 # Constants (no magic numbers per ClaudeCodeRules)
 POLL_INTERVAL_SECONDS = 3
@@ -191,6 +192,14 @@ def _process_job_result(job: dict, node, manifest: Manifest) -> None:
 
     if status == "ready":
         if matching_doc:
+            _trash_local_file(
+                matching_doc.local_path,
+                f"Device {node.device_id} {matching_doc.doc_type} (ready)",
+            )
+            manifest.clear_document_local_path(matching_doc.id)
+            if is_spec_sheet:
+                manifest.clear_node_pdf_path(node.device_id)
+                node.pdf_path = None
             manifest.mark_document_indexed(
                 matching_doc.id, ragscallion_job_id=job_id
             )
@@ -220,6 +229,15 @@ def _process_job_result(job: dict, node, manifest: Manifest) -> None:
 
     elif status == "failed":
         error_msg = job.get("error", "Unknown error")
+        if matching_doc:
+            _trash_local_file(
+                matching_doc.local_path,
+                f"Device {node.device_id} {matching_doc.doc_type} (failed)",
+            )
+            manifest.clear_document_local_path(matching_doc.id)
+            if is_spec_sheet:
+                manifest.clear_node_pdf_path(node.device_id)
+                node.pdf_path = None
         if is_spec_sheet:
             node.queue = 4
             node.stage_index_rag = 3  # STAGE_FAILED — must be set so retry filters can find it
@@ -229,7 +247,7 @@ def _process_job_result(job: dict, node, manifest: Manifest) -> None:
                 failure_category="RAGDB_INDEXING_FAILED",
                 failure_message=error_msg,
                 stage=3,  # STAGE_INDEX_RAG
-                retryable=False,
+                retryable=True,
             )
             logger.error(
                 f"Job {job_id} (spec_sheet) failed "

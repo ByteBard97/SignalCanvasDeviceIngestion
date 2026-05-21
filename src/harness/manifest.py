@@ -10,6 +10,11 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from send2trash import send2trash as _send2trash
+
+import logging
+logger = logging.getLogger(__name__)
+
 
 class StageStatus(str, Enum):
     """Pipeline stage completion status."""
@@ -42,7 +47,7 @@ class FailureCategory(str, Enum):
     RAGDB_COLLISION = "RAGDB_COLLISION"             # retryable: no (human decides)
     RAGSCALLION_UNAVAILABLE = "RAGSCALLION_UNAVAILABLE"  # retryable: yes (server down)
     RAGDB_SUBMISSION_ERROR = "RAGDB_SUBMISSION_ERROR"    # retryable: no (validation error)
-    RAGDB_INDEXING_FAILED = "RAGDB_INDEXING_FAILED"      # retryable: no (indexing logic)
+    RAGDB_INDEXING_FAILED = "RAGDB_INDEXING_FAILED"      # retryable: yes (transient indexing failure)
 
     # Stage 5 failure (extraction)
     EXTRACTION_FAILED = "EXTRACTION_FAILED"         # retryable: yes (refine prompt)
@@ -834,6 +839,23 @@ class Manifest:
                 (device_id,),
             )
             conn.commit()
+
+
+def _trash_local_file(path_str: Optional[str], context: str) -> None:
+    """Move a local file to trash after it has been uploaded to Ragscallion.
+
+    Manifest must be updated (local_path = NULL) before calling this so a
+    crash between the two leaves the DB in a consistent state.
+    """
+    if not path_str:
+        return
+    try:
+        p = Path(path_str)
+        if p.exists():
+            _send2trash(str(p))
+            logger.info(f"{context}: trashed local file {p}")
+    except Exception as e:
+        logger.warning(f"{context}: failed to trash {path_str}: {e}")
 
 
 # Backwards-compatibility alias for existing code

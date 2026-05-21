@@ -25,6 +25,7 @@ dependencies = [
     "lancedb>=0.1.0",
     "openai>=1.40.0",
     "python-dotenv>=1.0.0",
+    "Send2Trash>=2.1.0",
 ]
 
 [project.scripts]
