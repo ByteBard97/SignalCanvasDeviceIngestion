@@ -475,8 +475,8 @@ async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
                     f"the PDF may be a marketing brochure. Consider re-searching."
                 )
 
-            classification = await classify(node.manufacturer, node.model)
-            normalized = normalize_extraction(extracted, classification.class_)
+            device_class = node.device_class or (await classify(node.manufacturer, node.model)).class_
+            normalized = normalize_extraction(extracted, device_class)
             patch_source = generate_patch(normalized)
             node.stage_generate_patch = 2
 

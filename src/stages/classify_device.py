@@ -57,6 +57,10 @@ RULE_TABLE: list[tuple[str, str, str]] = [
              r"|ProConvert|FrameSync|MultiSync)\b.*", "converter"),
     # Confirmed AV brands that the LLM might misclassify due to brand association —
     # must come before any it_networking catch-alls
+    # Matrix routers — N×N signal routing without protocol conversion
+    # Must come BEFORE brand-level catch-alls so KUMO/Videohub models match
+    (r".*", r".*\b(kumo|videohub|matrix|crosspoint|router|ultrix)\b.*", "matrix_router"),
+    (r".*", r".*\bmx.*[0-9]+x[0-9]+.*", "matrix_router"),
     (r"LynxTechnik|Lynx.Technik", r".*", "generic"),
     (r"AJA", r".*", "generic"),
     (r"Ross.Video|Ross", r".*", "generic"),
@@ -162,6 +166,7 @@ VALID_CLASSES = {
     "mixing_console",
     "dsp_processor",
     "converter",
+    "matrix_router",
     "it_networking",
     "generic",
 }
@@ -213,6 +218,10 @@ _CLASSIFICATION_SYSTEM_PROMPT = (
     "re-clockers, frame synchronizers, protocol gateways. If the device name contains 'converter', "
     "'embedder', 'de-embedder', 'distribution amp', 're-clocker', or 'X to Y' (two protocols), "
     "use 'converter'.\n"
+    "- matrix_router: A device that routes signals between N inputs and N outputs of the same protocol "
+    "without conversion. Examples: AJA KUMO series, Blackmagic Videohub, Ross Video Ultrix, Evertz router. "
+    "If the model contains 'kumo', 'videohub', 'matrix', 'crosspoint', 'router', or an N×N pattern like "
+    "'16x16', use 'matrix_router'.\n"
     "- it_networking: Switches, routers, firewalls, access points, NAS/storage — IT infrastructure.\n"
     "- generic: Everything else — cameras, projectors, displays, speakers, mixers, amplifiers, "
     "recorders, intercoms, NDI devices, AVB devices, AES67 devices, USB audio interfaces, "

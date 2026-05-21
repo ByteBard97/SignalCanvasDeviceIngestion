@@ -249,6 +249,11 @@ def extract_specs_from_patchify(device_id: str) -> Optional[dict]:
         direction = "in"
         if inp.get("bidirectional"):
             direction = "io"
+        name_upper = label.upper()
+        if name_upper.startswith("GPO"):
+            direction = "out"
+        elif name_upper.startswith("GPI") and not name_upper.startswith("GPIO"):
+            direction = "in"
         connector = _map_connector(inp.get("connector", ""))
         signal = _map_signal(inp.get("signal", ""), inp.get("type", ""))
         raw_labels.append(label)
@@ -265,6 +270,11 @@ def extract_specs_from_patchify(device_id: str) -> Optional[dict]:
         direction = "out"
         if out.get("bidirectional"):
             direction = "io"
+        name_upper = label.upper()
+        if name_upper.startswith("GPO"):
+            direction = "out"
+        elif name_upper.startswith("GPI") and not name_upper.startswith("GPIO"):
+            direction = "in"
         connector = _map_connector(out.get("connector", ""))
         signal = _map_signal(out.get("signal", ""), out.get("type", ""))
         raw_labels.append(label)

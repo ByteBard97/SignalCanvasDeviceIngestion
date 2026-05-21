@@ -91,6 +91,8 @@ _BRIDGE_HEURISTICS: dict[str, list[tuple[str, str]]] = {
     "dsp_processor": [],
     # converter bridges are inferred from port structure — see _infer_converter_bridges
     "converter": [],
+    # matrix routers have no hardwired bridges — routing is configurable
+    "matrix_router": [],
 }
 
 # Signal type tokens that indicate a professional AV protocol — used for
@@ -177,6 +179,22 @@ def _infer_converter_bridges(ports: list[dict]) -> list[str]:
         return [f"{in_name} -> {out_name}"]
 
     return []
+
+
+def _infer_matrix_router(ports: list[dict]) -> bool:
+    """Detect matrix-router port structure: many inputs and outputs of same protocol."""
+    signal_ports = [p for p in ports if isinstance(p, dict) and not _is_non_signal_port(p)]
+
+    in_ports = [p for p in signal_ports if (p.get("direction") or "").lower() in ("input", "in")]
+    out_ports = [p for p in signal_ports if (p.get("direction") or "").lower() in ("output", "out")]
+
+    if len(in_ports) < 4 or len(out_ports) < 4:
+        return False
+
+    in_protos = {_port_protocol(p) for p in in_ports} - {None}
+    out_protos = {_port_protocol(p) for p in out_ports} - {None}
+
+    return bool(in_protos and in_protos == out_protos)
 
 _CONNECTOR_INFERENCES: list[tuple[str, str]] = [
     ("XLR", r"\bXLR\b"),
@@ -432,9 +450,8 @@ def _is_control_port(port: dict) -> bool:
     if "usb" in name and any(kw in name for kw in usb_control_keywords):
         return True
 
-    # Drop logic I/O ports (GPI/GPO, GPIO)
-    if name in ("gpi", "gpo", "gpio"):
-        return True
+    # GPI/GPO/GPIO are legitimate signal-flow ports on broadcast AV gear
+    # (tally, relay, logic I/O) and should stay in the patch.
 
     # For non-USB-named ports with USB connectors (e.g. "Console" on USB-A),
     # drop only if the name also suggests control
@@ -692,6 +709,12 @@ def apply_bridge_heuristics(extracted: dict, device_class: str) -> dict:
         inferred = _infer_converter_bridges(ports)
         if inferred:
             signal_flow["bridges"] = inferred
+        return extracted
+
+    # matrix_router class: detect from port structure even if rule missed
+    if device_class == "matrix_router":
+        if _infer_matrix_router(ports):
+            signal_flow["bridges"] = []
         return extracted
 
     for src_pat, dst_pat in heuristics:
