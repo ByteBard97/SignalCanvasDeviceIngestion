@@ -55,6 +55,9 @@ RULE_TABLE: list[tuple[str, str, str]] = [
     (r".*", r".*\b(embedder|de.embedder|disembedder|re.clocker|reclocker"
              r"|frame.sync(hronizer)?|distribution.amp(lifier)?|DA\d|transcoder"
              r"|ProConvert|FrameSync|MultiSync)\b.*", "converter"),
+    # Dante-enabled managed network switches — classify as it_networking
+    # (no audio signal-flow ports; Dante routing is at protocol level only)
+    (r"Luminex", r".*GigaCore.*", "it_networking"),
     # Confirmed AV brands that the LLM might misclassify due to brand association —
     # must come before any it_networking catch-alls
     # Matrix routers — N×N signal routing without protocol conversion
