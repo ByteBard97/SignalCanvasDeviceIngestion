@@ -498,7 +498,7 @@ async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
 
             # Stage 7.5: Completeness review
             node.stage_validate_patch = 2
-            is_complete, concerns = check_completeness(normalized, classification.class_)
+            is_complete, concerns = check_completeness(normalized, device_class)
             if not is_complete:
                 review_attempts = extracted.get("_completeness_review_attempts", 0) + 1
                 logger.warning(
@@ -564,7 +564,7 @@ def _load_devices(path: Path) -> list[tuple[str, str, str]]:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split("|")
+            parts = line.split("|", maxsplit=2)
             if len(parts) != 3:
                 logger.warning(f"Skipping malformed line: {line}")
                 continue

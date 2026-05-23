@@ -233,7 +233,9 @@ def main() -> int:
 
     with args.out.open("w") as f:
         for d in selected:
-            f.write(f"{d['manufacturer']}|{d['model']}|{d['device_id']}\n")
+            # Replace literal pipes in model names to avoid breaking the pipe-separated format.
+            model_safe = d['model'].replace("|", "/")
+            f.write(f"{d['manufacturer']}|{model_safe}|{d['device_id']}\n")
 
     print(f"Wrote {args.out}")
     return 0
