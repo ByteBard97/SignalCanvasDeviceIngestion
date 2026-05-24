@@ -18,6 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from ragscallion_health import ensure_ragscallion_running
+
 
 def run_command(cmd: list[str]) -> int:
     print(f"\n{'='*60}")
@@ -40,6 +42,8 @@ def main() -> int:
         print(f"\n{'#'*60}")
         print(f"# BATCH {batch_num}")
         print(f"{'#'*60}")
+
+        ensure_ragscallion_running()
 
         # Run the pipeline
         ret = run_command([

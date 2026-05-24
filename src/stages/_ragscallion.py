@@ -9,7 +9,9 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-RAGSCALLION_SEARCH_URL = "http://localhost:8086/search"
+from src.config import settings as _settings  # noqa: E402
+
+RAGSCALLION_SEARCH_URL = _settings.ragscallion_search_url()
 DEFAULT_SEARCH_LIMIT = 3
 DEFAULT_SEARCH_TIMEOUT = 30.0
 

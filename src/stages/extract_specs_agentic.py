@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-RAGSCALLION_SEARCH_URL = "http://localhost:8086/search"
+from src.config import settings as _settings  # noqa: E402
+RAGSCALLION_SEARCH_URL = _settings.ragscallion_search_url()
 DEFAULT_PASS_LIMIT = 5
 DEFAULT_GENERIC_LIMIT = 3
 MAX_RETRIES = 1

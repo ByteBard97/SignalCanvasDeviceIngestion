@@ -51,7 +51,7 @@ class DeviceIngestionPipeline:
         self.phase = phase
         self.manifest = IngestionManifest(settings.manifests_db)
         self.execution_state = IngestionState(current_phase=phase)
-        self.ragscallion_client = RagscallionClient()
+        self.ragscallion_client = RagscallionClient(base_url=settings.ragscallion_base_url())
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:

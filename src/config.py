@@ -1,8 +1,39 @@
 """Pipeline configuration from environment and defaults."""
 
+import socket
 from pathlib import Path
 
 from pydantic_settings import BaseSettings
+
+
+def _discover_ragscallion(configured_host: str, port: int, timeout: float = 1.0) -> str:
+    """Return the first reachable Ragscallion host.
+
+    Tries the configured host first; if unreachable, scans the /24 subnet
+    of the default gateway interface for a host with the port open.
+    """
+    def _reachable(host: str) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    if _reachable(configured_host):
+        return configured_host
+
+    # Derive local /24 subnet from hostname resolution of the local machine
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+        prefix = ".".join(local_ip.split(".")[:3])
+        for i in range(1, 255):
+            candidate = f"{prefix}.{i}"
+            if candidate != local_ip and _reachable(candidate):
+                return candidate
+    except OSError:
+        pass
+
+    return configured_host  # fall back; will fail at connection time with a clear error
 
 
 class Settings(BaseSettings):
@@ -56,6 +87,13 @@ class Settings(BaseSettings):
         self.output_dir.mkdir(exist_ok=True, parents=True)
         self.stdlib_output.mkdir(exist_ok=True, parents=True)
         self.pdf_cache_dir.mkdir(exist_ok=True, parents=True)
+
+    def ragscallion_base_url(self) -> str:
+        host = _discover_ragscallion(self.ragscallion_host, self.ragscallion_port)
+        return f"http://{host}:{self.ragscallion_port}"
+
+    def ragscallion_search_url(self) -> str:
+        return f"{self.ragscallion_base_url()}/search"
 
 
 # Singleton instance

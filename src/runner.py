@@ -742,7 +742,7 @@ async def run_pipeline(
     """Drive the full pipeline for devices listed in *devices_path*."""
     manifest_db = manifest_db or settings.manifests_db
     manifest = Manifest(manifest_db)
-    ragscallion_client = RagscallionClient()
+    ragscallion_client = RagscallionClient(base_url=settings.ragscallion_base_url())
 
     # Load/create nodes
     devices = _load_devices(devices_path)

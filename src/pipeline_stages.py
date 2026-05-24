@@ -2099,7 +2099,8 @@ async def _extract_specs_via_agent(
     repo_root = Path(__file__).resolve().parent.parent
     skills_dir = repo_root / ".claude" / "skills"
 
-    ragscallion_base_url = "http://localhost:8086"
+    from .config import settings as _settings
+    ragscallion_base_url = _settings.ragscallion_base_url()
 
     # Fetch combined context from patchify + EasySchematic
     combined_context = ""
