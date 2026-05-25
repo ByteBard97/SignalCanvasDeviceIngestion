@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,112 @@ logger = logging.getLogger(__name__)
 
 # Kimi CLI binary name
 KIMI_BINARY = "kimi"
+
+# Admission control: prevent OOM from too many concurrent Kimi subprocesses.
+# Each kimi CLI invocation can use 500MB-1GB resident; on a 24GB Mac running
+# Ragscallion polling, Python pipeline, plus other tools, ~5-6 concurrent is
+# the safe ceiling. Past sessions have seen SIGSEGV (-11) and OOM-kill (-9)
+# when this is uncapped.
+_MAX_CONCURRENT_KIMI = int(os.environ.get("MAX_CONCURRENT_KIMI", "5"))
+_MIN_FREE_MEM_MB = int(os.environ.get("KIMI_MIN_FREE_MEM_MB", "2048"))
+_MEM_WAIT_TIMEOUT_SECS = float(os.environ.get("KIMI_MEM_WAIT_TIMEOUT", "120"))
+_kimi_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_kimi_semaphore() -> asyncio.Semaphore:
+    """Lazy-init the semaphore so it binds to the current event loop."""
+    global _kimi_semaphore
+    if _kimi_semaphore is None:
+        _kimi_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_KIMI)
+    return _kimi_semaphore
+
+
+def _free_memory_mb() -> int:
+    """Return approximate usable free memory in MB (macOS vm_stat).
+
+    Returns a huge value on parse failure so callers don't block when the
+    check itself is broken.
+    """
+    try:
+        result = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, timeout=2
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return 999_999
+
+    page_size = 16384
+    free_pages = inactive_pages = spec_pages = 0
+    for line in result.stdout.splitlines():
+        if "page size of" in line:
+            try:
+                page_size = int(line.split("page size of")[1].split()[0])
+            except (IndexError, ValueError):
+                pass
+        elif line.startswith("Pages free:"):
+            free_pages = int(line.split()[-1].rstrip("."))
+        elif line.startswith("Pages inactive:"):
+            inactive_pages = int(line.split()[-1].rstrip("."))
+        elif line.startswith("Pages speculative:"):
+            spec_pages = int(line.split()[-1].rstrip("."))
+    usable_bytes = (free_pages + inactive_pages + spec_pages) * page_size
+    return usable_bytes // (1024 * 1024)
+
+
+def _count_kimi_processes() -> tuple[int, int]:
+    """Return (process_count, total_rss_mb) for currently running kimi CLI
+    invocations on this machine. Used as a defensive cross-check on top of
+    our own semaphore — other users of the Mac may also be running kimi."""
+    try:
+        result = subprocess.run(
+            ["ps", "ax", "-o", "rss=,command="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return 0, 0
+    count = 0
+    rss_kb = 0
+    for line in result.stdout.splitlines():
+        if "kimi-cli" in line or "/kimi " in line or line.rstrip().endswith("/kimi"):
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2:
+                try:
+                    rss_kb += int(parts[0])
+                    count += 1
+                except ValueError:
+                    pass
+    return count, rss_kb // 1024
+
+
+async def _wait_for_memory_headroom() -> bool:
+    """Block until system has enough free RAM to safely spawn another Kimi.
+
+    Returns False if we time out waiting (caller should treat as failure
+    rather than spawning under memory pressure).
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + _MEM_WAIT_TIMEOUT_SECS
+    logged_wait = False
+    while True:
+        free_mb = _free_memory_mb()
+        proc_count, proc_rss = _count_kimi_processes()
+        # OK if either: plenty of free memory, OR only a few kimi procs running
+        if free_mb >= _MIN_FREE_MEM_MB and proc_count <= _MAX_CONCURRENT_KIMI:
+            return True
+        if loop.time() >= deadline:
+            logger.warning(
+                "Kimi admission timeout: free=%dMB (need %d), "
+                "kimi_procs=%d using %dMB",
+                free_mb, _MIN_FREE_MEM_MB, proc_count, proc_rss,
+            )
+            return False
+        if not logged_wait:
+            logger.info(
+                "Kimi admission: waiting for memory headroom "
+                "(free=%dMB, procs=%d using %dMB)",
+                free_mb, proc_count, proc_rss,
+            )
+            logged_wait = True
+        await asyncio.sleep(3.0)
 
 
 async def _kill_proc_group(proc: asyncio.subprocess.Process) -> None:
@@ -77,16 +184,23 @@ async def run_kimi(
     logger.debug("Running Kimi command: %s", " ".join(cmd))
 
     proc: Optional[asyncio.subprocess.Process] = None
+    semaphore = _get_kimi_semaphore()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
+        async with semaphore:
+            if not await _wait_for_memory_headroom():
+                logger.error(
+                    "Refusing to spawn Kimi: insufficient memory headroom"
+                )
+                return None
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
     except asyncio.TimeoutError:
         logger.error("Kimi subprocess timed out after %.0fs", timeout)
         if proc is not None:
