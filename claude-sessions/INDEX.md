@@ -4,3 +4,4 @@
 [2026-05-13 23:00] [ebb8834f] Per-stage worker architecture implemented — each stage is now an independent polling loop, no more snapshot-and-gather barrier → 2026-05-11_ebb8834f.md
 [2026-05-13 13:35] [ebb8834f] 188 patches exported, analytics built, GitHub URL fix, classifier rules, Ragscallion reverted to subprocess → 2026-05-11_ebb8834f.md
 [2026-05-16 20:00] [4e67934c] Library infrastructure built (migration, quality tiers, selection script, rolling pipeline), 35 devices exported → 2026-05-16_4e67934c.md
+[2026-05-25 15:25] [66fb8190] rolling_v20: fixed infinite retry loop + stuck queue=1 devices, 85+ completed, top-up halted at 60% → 2026-05-25_66fb8190.md

@@ -721,6 +721,9 @@ def _query_stage_2_nodes(manifest: Manifest) -> list[DeviceNode]:
     }.values())
 
 
+_MAX_STAGE_34_ATTEMPTS = 5
+
+
 def _query_stage_34_nodes(manifest: Manifest) -> list[DeviceNode]:
     return list({
         n.device_id: n for n in (
@@ -731,6 +734,7 @@ def _query_stage_34_nodes(manifest: Manifest) -> list[DeviceNode]:
         if n.stage_download_pdf == STAGE_COMPLETED
         and n.stage_index_rag not in (STAGE_COMPLETED, 1)
         and not (n.queue == QUEUE_4_MANUAL_REVIEW and not n.failure_retryable)
+        and (n.failure_attempts or 0) < _MAX_STAGE_34_ATTEMPTS
     }.values())
 
 

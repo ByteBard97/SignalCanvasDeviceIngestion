@@ -2228,12 +2228,13 @@ async def process_stage_5_batch(
     """
     # Get all nodes ready for extraction (queue_3)
     nodes = manifest.list_by_queue(QUEUE_3_READY_FOR_EXTRACTION)
-    # Also retry queue_4 nodes that failed extraction but are retryable
+    # Also retry queue_4 nodes that failed extraction but are retryable (cap at 5)
     retry_nodes = [
         n for n in manifest.list_by_queue(QUEUE_4_MANUAL_REVIEW)
         if n.stage_extract_specs == STAGE_FAILED
         and n.failure_retryable
         and not n.specs_json  # Skip if we already have specs from a prior success
+        and (n.failure_attempts or 0) < 5
     ]
     nodes = list({n.device_id: n for n in nodes + retry_nodes}.values())
 
