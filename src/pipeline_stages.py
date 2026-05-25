@@ -2030,8 +2030,19 @@ async def stage_5_extract_specs(
                 logger.warning(f"Device {node.device_id} extraction failed")
                 return False
 
-            # Success: store specs, mark complete, advance out of queue_3
-            # so the runner does not re-pick it up in subsequent Stage 5 batches.
+            # Success: store specs, mark complete, advance out of queue_3.
+            # Preserve _completeness_review_attempts from prior pass so the
+            # 2-strike limit in runner.py fires correctly on repeat failures.
+            if node.specs_json:
+                try:
+                    prior_meta = json.loads(node.specs_json)
+                    attempts = prior_meta.get("_completeness_review_attempts")
+                    if attempts:
+                        parsed = json.loads(spec_json)
+                        parsed["_completeness_review_attempts"] = attempts
+                        spec_json = json.dumps(parsed)
+                except Exception:
+                    pass
             node.specs_json = spec_json
             node.stage_extract_specs = STAGE_COMPLETED
             node.queue = QUEUE_5_COMPLETED
