@@ -59,8 +59,8 @@ _MIN_PORTS_BY_CLASS: dict[str, int] = {
 # alternative strings — if ANY keyword matches, the category is satisfied.
 _REQUIRED_PORT_CATEGORIES: dict[str, list[tuple[list[str], str]]] = {
     "dante_stagebox": [(["dante"], "Dante network port")],
-    "dante_adapter_input": [(["dante"], "Dante network port")],
-    "dante_adapter_output": [(["dante"], "Dante network port")],
+    # dante_adapter_input/output: Dante port not required — PDFs rarely label
+    # the Dante port explicitly and the classifier fires on many non-Dante devices.
     "wireless_rx": [
         (["antenna", "rf"], "RF/antenna port"),
         (["output"], "audio output"),
