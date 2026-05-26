@@ -26,7 +26,11 @@ from typing import Optional
 import httpx
 from openai import AsyncOpenAI
 
-from .call_budget import CallBudgetExceeded, try_consume
+# Absolute (not relative) import: this module is loaded top-level as
+# `moonshot_client` via the stages' sys.path shim, where a relative import has
+# no parent package. `src.call_budget` self-aliases so this is the same single
+# module the CLI chokepoints use. See call_budget.py.
+from src.call_budget import CallBudgetExceeded, try_consume
 
 # Explicitly load .env so MOONSHOT_API_KEY is available regardless of how
 # this module is imported (direct, via runner, in background tasks, etc.)

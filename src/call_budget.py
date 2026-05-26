@@ -1,10 +1,10 @@
 """Per-device LLM call budget.
 
-A hard ceiling on the number of LLM subprocess spawns (Kimi or Haiku) any
-single device may trigger within one pipeline run. This is the authoritative
-defense against runaway retry loops: it is enforced at the subprocess
-chokepoints (run_kimi / _run_claude) and so survives bugs in any individual
-stage's retry gating.
+A hard ceiling on the number of LLM invocations (Kimi CLI, Haiku CLI, or
+Moonshot HTTP) any single device may trigger within one pipeline run. This is
+the authoritative defense against runaway retry loops: it is enforced at the
+three LLM chokepoints (run_kimi / _run_claude / MoonshotClient.chat_completion)
+and so survives bugs in any individual stage's retry gating.
 
 In-memory and per-run by design — see
 docs/superpowers/plans/2026-05-26-per-device-llm-call-budget.md for why a
@@ -15,7 +15,19 @@ from __future__ import annotations
 
 import logging
 import os
+import sys as _sys
 import threading
+
+# This module is reached under two import names because the codebase is loaded
+# both as a package (`src.call_budget`, e.g. under pytest / `python -m
+# src.runner`) and top-level (`call_budget`, via the stages' sys.path shim that
+# loads moonshot_client bare). Without aliasing those would be two distinct
+# module objects with two separate _counts maps — a budget split-brain where
+# reset_all() clears only one. Self-alias both names to this single object so
+# every chokepoint shares one count map. importlib.reload re-executes in place,
+# so the test fixtures' reload-cap pattern keeps pointing at the same object.
+_sys.modules.setdefault("call_budget", _sys.modules[__name__])
+_sys.modules.setdefault("src.call_budget", _sys.modules[__name__])
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +36,11 @@ class CallBudgetExceeded(RuntimeError):
     """Raised by chokepoints that cannot return a sentinel (e.g. chat_completion)."""
 
 
-# Legitimate worst-case device path is ~6 LLM spawns; 8 gives headroom while
-# turning a runaway loop into a bounded 8-call loss. Override for tests / tuning.
-MAX_LLM_CALLS_PER_DEVICE = int(os.environ.get("MAX_LLM_CALLS_PER_DEVICE", "8"))
+# Worst-case legit path is ~12-15 LLM calls (classify + SKU + find-PDF/HTML
+# retries + extract + re-extract, with Haiku->Kimi fallbacks each doubling a
+# step). 12 covers the common path while turning a runaway loop into a bounded
+# loss. Override via env for tests / tuning.
+MAX_LLM_CALLS_PER_DEVICE = int(os.environ.get("MAX_LLM_CALLS_PER_DEVICE", "12"))
 
 _lock = threading.Lock()
 _counts: dict[str, int] = {}
