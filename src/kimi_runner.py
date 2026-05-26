@@ -10,6 +10,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from . import call_budget
+
 logger = logging.getLogger(__name__)
 
 # Kimi CLI binary name
@@ -148,6 +150,7 @@ async def run_kimi(
     work_dir: Path,
     timeout: float = 180.0,
     max_steps: int = 30,
+    device_id: str | None = None,
 ) -> Optional[str]:
     """Invoke the Kimi CLI non-interactively and return its stdout.
 
@@ -159,10 +162,15 @@ async def run_kimi(
         max_steps: Cap on agent loop iterations (--max-steps-per-turn).
             Use a small value (3-5) for narrow look-up tasks like Stage 1
             so Kimi fail-fasts instead of burning budget on exploration.
+        device_id: Device this call is attributed to, for per-device call
+            budgeting. None means the call is untracked (always allowed).
 
     Returns:
         Kimi's stdout as a string, or None on failure / timeout.
     """
+    if not call_budget.try_consume(device_id):
+        return None
+
     if not shutil.which(KIMI_BINARY):
         logger.error("Kimi CLI not found on PATH")
         return None
