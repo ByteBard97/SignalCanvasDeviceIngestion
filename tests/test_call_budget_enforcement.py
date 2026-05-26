@@ -57,3 +57,26 @@ async def test_run_claude_refuses_when_over_budget(budget, monkeypatch):
     )
     assert result is None
     assert spawned["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_refuses_when_over_budget(budget, monkeypatch):
+    from src.call_budget import CallBudgetExceeded
+    import src.moonshot_client as mc
+
+    client = mc.MoonshotClient()
+    budget.try_consume("dev-z")  # cap=1, exhaust it
+
+    # Patch the underlying OpenAI SDK call so a hypothetical un-gated request
+    # would be detectable; the gate should prevent it from being reached.
+    called = {"http": 0}
+
+    async def fake_create(*a, **k):
+        called["http"] += 1
+        raise AssertionError("HTTP request must not fire when over budget")
+
+    monkeypatch.setattr(client._client.chat.completions, "create", fake_create)
+
+    with pytest.raises(CallBudgetExceeded):
+        await client.chat_completion("hi", device_id="dev-z")
+    assert called["http"] == 0

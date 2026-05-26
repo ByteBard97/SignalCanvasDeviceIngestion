@@ -16,6 +16,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from moonshot_client import MoonshotClient  # noqa: E402
 
+from src.call_budget import CallBudgetExceeded
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -243,6 +245,7 @@ async def _classify_by_llm(
     model: str,
     markdown_excerpt: Optional[str] = None,
     moonshot: Optional[MoonshotClient] = None,
+    device_id: str | None = None,
 ) -> Classification:
     """Ask Moonshot to classify when no rule matches."""
     client = moonshot or MoonshotClient()
@@ -260,7 +263,10 @@ async def _classify_by_llm(
             model=CLASSIFIER_MODEL,
             system=_CLASSIFICATION_SYSTEM_PROMPT,
             temperature=0.0,
+            device_id=device_id,
         )
+    except CallBudgetExceeded:
+        raise
     except Exception as exc:
         logger.warning(f"LLM classification failed for {manufacturer} {model}: {exc}")
         return Classification(class_="generic", confidence=LLM_FALLBACK_CONFIDENCE, source="llm")
@@ -290,9 +296,10 @@ async def classify(
     model: str,
     markdown_excerpt: Optional[str] = None,
     moonshot: Optional[MoonshotClient] = None,
+    device_id: str | None = None,
 ) -> Classification:
     """Classify a device using rules first, then LLM fallback."""
     rule_result = _classify_by_rule(manufacturer, model)
     if rule_result is not None:
         return rule_result
-    return await _classify_by_llm(manufacturer, model, markdown_excerpt, moonshot)
+    return await _classify_by_llm(manufacturer, model, markdown_excerpt, moonshot, device_id=device_id)

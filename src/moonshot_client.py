@@ -26,6 +26,8 @@ from typing import Optional
 import httpx
 from openai import AsyncOpenAI
 
+from .call_budget import CallBudgetExceeded, try_consume
+
 # Explicitly load .env so MOONSHOT_API_KEY is available regardless of how
 # this module is imported (direct, via runner, in background tasks, etc.)
 try:
@@ -100,12 +102,16 @@ class MoonshotClient:
         max_tokens: Optional[int] = None,
         response_format_json: bool = False,
         seed: Optional[int] = None,
+        device_id: str | None = None,
     ) -> tuple[str, UsageRecord]:
         """Send a single-turn chat completion and return (text, usage).
 
         This is single-turn by design — for agentic web-search loops use the
         kimi CLI via kimi_runner.run_kimi() instead.
         """
+        if not try_consume(device_id):
+            raise CallBudgetExceeded(f"device {device_id} over LLM budget")
+
         messages: list[dict] = []
         if system:
             messages.append({"role": "system", "content": system})

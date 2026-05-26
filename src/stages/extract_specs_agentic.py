@@ -24,6 +24,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from moonshot_client import MoonshotClient, UsageRecord  # noqa: E402
 from stages._ragscallion import search_ragscallion  # noqa: E402
 from stages.classify_device import classify, Classification  # noqa: E402
+from src.call_budget import CallBudgetExceeded
 from stages.normalize_specs import (
     normalize_extraction,
     _canonicalize_name,
@@ -326,6 +327,7 @@ async def _run_llm_pass(
     prompt: str,
     moonshot: MoonshotClient,
     max_tokens: Optional[int] = None,
+    device_id: str | None = None,
 ) -> tuple[dict, str, int, str, UsageRecord]:
     """Run a single LLM pass and return (parsed, raw_text, estimated_tokens, tier, usage)."""
     estimated = await moonshot.estimate_tokens(prompt)
@@ -337,6 +339,7 @@ async def _run_llm_pass(
         temperature=EXTRACTION_TEMPERATURE,
         seed=EXTRACTION_SEED,
         max_tokens=max_tokens,
+        device_id=device_id,
     )
     try:
         parsed: dict = json.loads(text)
@@ -598,7 +601,10 @@ async def _extract_peripheral_ports(
             response_format_json=True,
             temperature=EXTRACTION_TEMPERATURE,
             seed=EXTRACTION_SEED,
+            device_id=device_id,
         )
+    except CallBudgetExceeded:
+        raise
     except Exception as exc:
         logger.warning(f"Peripheral pass LLM call failed for {manufacturer} {model}: {exc}")
         return []
@@ -664,6 +670,7 @@ async def extract(
     corpus_id: str,
     http: httpx.AsyncClient,
     moonshot: MoonshotClient,
+    device_id: str | None = None,
 ) -> tuple[dict, ExtractionTrace]:
     """Hybrid two-pass extraction with validation and retry."""
     trace = ExtractionTrace(
@@ -680,7 +687,7 @@ async def extract(
         trace.disambiguation_applied = True
 
     # 1. Classify
-    classification = await classify(manufacturer, model)
+    classification = await classify(manufacturer, model, device_id=device_id)
     trace.classification = classification
 
     # 2. Load templates
@@ -748,14 +755,16 @@ async def extract(
     # 8. Run Pass A (ports) and Pass B (metadata)
     prompt_a = _build_ports_prompt(manufacturer, model, chunks_to_use, disambiguation)
     extracted_ports, text_a, est_a, tier_a, usage_a = await _run_llm_pass(
-        prompt_a, moonshot, max_tokens=1200
+        prompt_a, moonshot, max_tokens=1200, device_id=device_id
     )
     trace.pass_a_tokens = est_a
     trace.pass_a_tier = tier_a
     logger.info(f"{manufacturer} {model} (ports pass): estimated {est_a} tokens → tier {tier_a}")
 
     prompt_b = _build_metadata_prompt(manufacturer, model, chunks_to_use, disambiguation)
-    extracted_metadata, text_b, est_b, tier_b, usage_b = await _run_llm_pass(prompt_b, moonshot)
+    extracted_metadata, text_b, est_b, tier_b, usage_b = await _run_llm_pass(
+        prompt_b, moonshot, device_id=device_id
+    )
     trace.pass_b_tokens = est_b
     trace.pass_b_tier = tier_b
     trace.estimated_input_tokens = est_a + est_b
@@ -881,6 +890,7 @@ async def extract_n_shot(
     model: str,
     moonshot: MoonshotClient,
     n: int = 3,
+    device_id: str | None = None,
 ) -> tuple[dict, ExtractionTrace]:
     """Run extraction N times and merge results via majority voting.
 
@@ -902,13 +912,13 @@ async def extract_n_shot(
       - retries = max across runs
     """
     if n <= 1:
-        return await extract(manufacturer, model, corpus_id, http, moonshot)
+        return await extract(manufacturer, model, corpus_id, http, moonshot, device_id=device_id)
 
     sem = asyncio.Semaphore(2)
 
     async def _one() -> tuple[dict, ExtractionTrace]:
         async with sem:
-            return await extract(manufacturer, model, corpus_id, http, moonshot)
+            return await extract(manufacturer, model, corpus_id, http, moonshot, device_id=device_id)
 
     results: list[tuple[dict, ExtractionTrace]] = []
     for _ in range(n):

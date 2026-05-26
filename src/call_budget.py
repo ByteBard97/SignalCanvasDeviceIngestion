@@ -19,6 +19,11 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+
+class CallBudgetExceeded(RuntimeError):
+    """Raised by chokepoints that cannot return a sentinel (e.g. chat_completion)."""
+
+
 # Legitimate worst-case device path is ~6 LLM spawns; 8 gives headroom while
 # turning a runaway loop into a bounded 8-call loss. Override for tests / tuning.
 MAX_LLM_CALLS_PER_DEVICE = int(os.environ.get("MAX_LLM_CALLS_PER_DEVICE", "8"))
