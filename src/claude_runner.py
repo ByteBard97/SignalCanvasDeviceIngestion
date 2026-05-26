@@ -17,6 +17,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+from . import call_budget
 from .kimi_runner import extract_json_block, run_kimi, _kill_proc_group
 
 logger = logging.getLogger(__name__)
@@ -61,15 +62,19 @@ async def run_extraction(
     work_dir: Path,
     timeout: float = 120.0,
     max_steps: int = 30,
+    device_id: str | None = None,
 ) -> Optional[str]:
     """Haiku first, Kimi fallback. Use for simple structured tasks."""
-    result = await _run_claude(prompt, skills_dir=skills_dir, work_dir=work_dir, timeout=timeout)
+    result = await _run_claude(
+        prompt, skills_dir=skills_dir, work_dir=work_dir, timeout=timeout,
+        device_id=device_id,
+    )
     if result is not None:
         return result
     logger.warning("Claude Haiku failed — falling back to Kimi")
     return await run_kimi(
         prompt, skills_dir=skills_dir, work_dir=work_dir,
-        timeout=timeout, max_steps=max_steps,
+        timeout=timeout, max_steps=max_steps, device_id=device_id,
     )
 
 
@@ -82,6 +87,7 @@ async def run_extraction_routed(
     has_critique: bool = False,
     timeout: float = 120.0,
     max_steps: int = 30,
+    device_id: str | None = None,
 ) -> Optional[str]:
     """Route to Haiku or Kimi based on device class and whether this is a retry.
 
@@ -96,17 +102,20 @@ async def run_extraction_routed(
         logger.info("Routing to Kimi directly (%s)", reason)
         return await run_kimi(
             prompt, skills_dir=skills_dir, work_dir=work_dir,
-            timeout=timeout, max_steps=max_steps,
+            timeout=timeout, max_steps=max_steps, device_id=device_id,
         )
 
     logger.info("Routing to Haiku first (class '%s')", device_class)
-    result = await _run_claude(prompt, skills_dir=skills_dir, work_dir=work_dir, timeout=timeout)
+    result = await _run_claude(
+        prompt, skills_dir=skills_dir, work_dir=work_dir, timeout=timeout,
+        device_id=device_id,
+    )
     if result is not None:
         return result
     logger.warning("Haiku failed for class '%s' — falling back to Kimi", device_class)
     return await run_kimi(
         prompt, skills_dir=skills_dir, work_dir=work_dir,
-        timeout=timeout, max_steps=max_steps,
+        timeout=timeout, max_steps=max_steps, device_id=device_id,
     )
 
 
@@ -116,8 +125,11 @@ async def _run_claude(
     skills_dir: Path,
     work_dir: Path,
     timeout: float,
+    device_id: str | None = None,
 ) -> Optional[str]:
     """Invoke the Claude Code CLI non-interactively with Haiku."""
+    if not call_budget.try_consume(device_id):
+        return None
     if not shutil.which(CLAUDE_BINARY):
         logger.debug("Claude CLI not found on PATH")
         return None
