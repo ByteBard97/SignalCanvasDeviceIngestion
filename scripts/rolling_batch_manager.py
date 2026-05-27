@@ -20,8 +20,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # for sibling select_devices
 
 from harness.manifest import Manifest, QUEUE_4_MANUAL_REVIEW, QUEUE_5_COMPLETED
+# Share the single garbage-model filter so mid-run top-up selection cannot
+# re-admit junk entries (bare connector/format model names) that the initial
+# select_devices.py selection already excludes.
+from select_devices import _is_garbage_model
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIBRARY_ROOT = REPO_ROOT.parent / "SignalCanvasDeviceLibrary"
@@ -110,7 +115,9 @@ def select_replacements(
 
     candidates = [
         d for d in pool
-        if d["device_id"] not in excluded and d["device_id"] not in processed
+        if d["device_id"] not in excluded
+        and d["device_id"] not in processed
+        and not _is_garbage_model(d["label"])
     ]
 
     random.seed(int(datetime.now(timezone.utc).timestamp()))
