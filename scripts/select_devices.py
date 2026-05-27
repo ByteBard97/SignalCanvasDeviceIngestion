@@ -34,6 +34,17 @@ OUTPUT_DIR = REPO_ROOT / "output"
 
 VALID_REASON_CODES = {"CIT", "OOS", "DUP", "DSC", "NDS"}
 
+# Connector/format/signal terms that are NOT real product names — filtering these
+# prevents bare connector types (e.g. "USB C", "HDMI") from entering the pipeline
+# as if they were actual SKUs.
+GENERIC_ONLY_MODELS: frozenset[str] = frozenset({
+    "usb", "usb a", "usb c", "rj45", "hdmi", "sdi", "hd sdi", "3g sdi", "12g sdi",
+    "xlr", "analog", "aes", "aes3", "aes67", "spdif", "optical", "toslink",
+    "coax", "coaxial", "bnc", "ethernet", "poe", "dante", "madi", "dvi", "vga",
+    "displayport", "dp", "thunderbolt", "rca", "trs", "trrs", "balanced",
+    "unbalanced", "line", "mic", "network", "lan", "sfp", "fiber",
+})
+
 # Manufacturers known to produce core professional AV gear (+2 score each)
 PRIORITY_MANUFACTURERS: set[str] = {
     "yamaha", "shure", "sennheiser", "qsc", "allen-heath", "allen_heath",
@@ -58,6 +69,23 @@ PRIORITY_SIGNALS: set[str] = {
 }
 
 _META_FIELD_RE = re.compile(r'(\w+):\s*"([^"]*)"')
+
+
+def _normalize_model(model: str) -> str:
+    """Normalize a model string for garbage detection."""
+    normalized = model.lower().strip()
+    normalized = normalized.replace("-", " ").replace("_", " ")
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = normalized.strip(" .,;:!?'")
+    return normalized
+
+
+def _is_garbage_model(model: str) -> bool:
+    """Return True if model is a generic connector/signal name, not a real SKU."""
+    normalized = _normalize_model(model)
+    if not normalized or len(normalized) < 2:
+        return True
+    return normalized in GENERIC_ONLY_MODELS
 
 
 def _parse_meta(patch_text: str) -> dict[str, str]:
@@ -164,7 +192,20 @@ def select(
 ) -> list[dict]:
     rng = random.Random(seed)
 
-    pool = [d for d in devices if d["device_id"] not in excluded and d["device_id"] not in processed]
+    pool = []
+    garbage_ids = []
+    for d in devices:
+        if d["device_id"] in excluded or d["device_id"] in processed:
+            continue
+        if _is_garbage_model(d["model"]):
+            garbage_ids.append(d["device_id"])
+            continue
+        pool.append(d)
+
+    if garbage_ids:
+        print(
+            f"Pre-filtered {len(garbage_ids)} garbage device(s) (generic-only model name): {','.join(garbage_ids)}"
+        )
 
     if prioritize:
         # Sort by score descending, break ties randomly
