@@ -558,6 +558,7 @@ async def _extract_peripheral_ports(
     manufacturer: str,
     model: str,
     moonshot: MoonshotClient,
+    device_id: str | None = None,
 ) -> list[dict]:
     """Second-pass extraction focused on peripheral ports only.
 
@@ -791,7 +792,8 @@ async def extract(
             existing_ports = []
         try:
             new_ports = await _extract_peripheral_ports(
-                http, corpus_id, existing_ports, manufacturer, model, moonshot
+                http, corpus_id, existing_ports, manufacturer, model, moonshot,
+                device_id=device_id,
             )
             if new_ports:
                 extracted.setdefault("signal_flow", {}).setdefault("ports", []).extend(new_ports)

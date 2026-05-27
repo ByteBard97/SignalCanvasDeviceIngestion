@@ -195,7 +195,11 @@ def generate_patch(extracted: dict) -> str:
     if manufacturer:
         lines.append(f'    manufacturer: "{manufacturer}"')
     if model:
-        lines.append(f'    model: "{model}"')
+        # PatchLang parser does not support escaped quotes inside string literals.
+        # Replace the ASCII double-quote (inch symbol) with the Unicode double-prime
+        # U+2033 "″" which parses cleanly and reads identically.
+        safe_model = model.replace('"', '\u2033')
+        lines.append(f'    model: "{safe_model}"')
     if category:
         lines.append(f'    category: "{category}"')
     lines.append("  }")
