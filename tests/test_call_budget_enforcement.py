@@ -1,15 +1,21 @@
-import importlib
 from pathlib import Path
 
 import pytest
 
 
 @pytest.fixture
-def budget(monkeypatch):
-    monkeypatch.setenv("MAX_LLM_CALLS_PER_DEVICE", "1")
+def budget():
+    """Cap of 1 + clean counts, restored on teardown.
+
+    Sets the module global directly rather than reload()+setenv so the cap does
+    not leak into later tests (try_consume reads the global at call time).
+    """
     import src.call_budget as cb
-    importlib.reload(cb)
+    original = cb.MAX_LLM_CALLS_PER_DEVICE
+    cb.MAX_LLM_CALLS_PER_DEVICE = 1
+    cb.reset_all()
     yield cb
+    cb.MAX_LLM_CALLS_PER_DEVICE = original
     cb.reset_all()
 
 

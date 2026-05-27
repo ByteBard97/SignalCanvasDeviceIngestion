@@ -1,14 +1,20 @@
-import importlib
 import pytest
 
 
 @pytest.fixture
-def budget(monkeypatch):
-    """Fresh module state + known cap for each test."""
-    monkeypatch.setenv("MAX_LLM_CALLS_PER_DEVICE", "3")
+def budget():
+    """Known cap + clean counts for each test, restored on teardown.
+
+    Sets the module global directly rather than reload()+setenv: try_consume
+    reads MAX_LLM_CALLS_PER_DEVICE at call time, and a reload would leave the
+    test's cap baked into the module for every later test in the session.
+    """
     import src.call_budget as cb
-    importlib.reload(cb)
+    original = cb.MAX_LLM_CALLS_PER_DEVICE
+    cb.MAX_LLM_CALLS_PER_DEVICE = 3
+    cb.reset_all()
     yield cb
+    cb.MAX_LLM_CALLS_PER_DEVICE = original
     cb.reset_all()
 
 
