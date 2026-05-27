@@ -656,10 +656,27 @@ def _summarize_device_status(nodes: list[DeviceNode]) -> None:
 
 
 def _is_pipeline_done(manifest: Manifest) -> bool:
-    """Return True if no nodes remain in queues 0, 1, 2, or 3."""
-    for q in (QUEUE_0_INITIAL, QUEUE_1_CANNOT_FIND_PDF, QUEUE_2_POLLING_RAGSCALLION, QUEUE_3_READY_FOR_EXTRACTION):
+    """Return True when no stage worker can still make progress.
+
+    Queues 0/2/3 always represent in-flight work (queue 2 = Ragscallion indexing
+    in progress, which must NOT be terminated early). Queue 1 (cannot-find-pdf)
+    and queue 4 (manual review) are catch-all buckets where retry-exhausted nodes
+    come to rest permanently, so their non-emptiness alone must not keep the run
+    alive — otherwise the run never terminates (no .done sentinel) once any node
+    settles there. Treat them as terminal unless a stage query can still pick a
+    node up for another attempt.
+    """
+    for q in (QUEUE_0_INITIAL, QUEUE_2_POLLING_RAGSCALLION, QUEUE_3_READY_FOR_EXTRACTION):
         if manifest.list_by_queue(q):
             return False
+    if (
+        _query_stage_0_nodes(manifest)
+        or _query_stage_1_nodes(manifest)
+        or _query_stage_1b_nodes(manifest)
+        or _query_stage_2_nodes(manifest)
+        or _query_stage_34_nodes(manifest)
+    ):
+        return False
     return True
 
 
