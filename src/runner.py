@@ -55,6 +55,7 @@ from .ragscallion_client import RagscallionClient
 from .stages.generate_patch import generate_patch
 from .stages.normalize_specs import normalize_extraction
 from .stages.validate_patch import validate_patch
+from src.call_budget import CallBudgetExceeded
 from .stages.classify_device import classify
 from .stages.combined_device_context import get_combined_context
 from .recovery import recovery_router
@@ -267,9 +268,24 @@ async def _run_scope_check(nodes: list[DeviceNode], manifest: Manifest) -> list[
                 parts.append(f"Ports: {port_summary}")
             excerpt = "\n".join(parts)
 
-        classification = await classify(
-            node.manufacturer, node.model, markdown_excerpt=excerpt or None
-        )
+        try:
+            classification = await classify(
+                node.manufacturer, node.model, markdown_excerpt=excerpt or None, device_id=node.device_id
+            )
+        except CallBudgetExceeded:
+            logger.warning(
+                f"Device {node.device_id}: scope-check classification skipped — LLM budget exceeded"
+            )
+            node.failure_stage = STAGE_FIND_PDF
+            node.failure_category = FailureCategory.OUT_OF_SCOPE.value
+            node.failure_message = "LLM call budget exceeded during scope-check classification"
+            node.failure_retryable = False
+            node.failure_attempts += 1
+            node.failure_at = datetime.now(timezone.utc).isoformat()
+            node.queue = QUEUE_4_MANUAL_REVIEW
+            manifest.persist(node)
+            continue
+
         node.device_class = classification.class_
         if classification.class_ == "it_networking":
             logger.info(
@@ -475,7 +491,7 @@ async def _run_stage_67_batch(manifest: Manifest) -> dict[str, int]:
                     f"the PDF may be a marketing brochure. Consider re-searching."
                 )
 
-            device_class = node.device_class or (await classify(node.manufacturer, node.model)).class_
+            device_class = node.device_class or (await classify(node.manufacturer, node.model, device_id=node.device_id)).class_
             normalized = normalize_extraction(extracted, device_class)
             patch_source = generate_patch(normalized)
             node.stage_generate_patch = 2
@@ -678,6 +694,7 @@ def _query_stage_0_nodes(manifest: Manifest) -> list[DeviceNode]:
             + manifest.list_by_queue(QUEUE_1_CANNOT_FIND_PDF)
         )
         if n.stage_resolve_sku in (STAGE_NOT_STARTED, STAGE_FAILED)
+        and (n.failure_attempts or 0) < _MAX_STAGE_ATTEMPTS
     }.values())
 
 
@@ -721,7 +738,7 @@ def _query_stage_2_nodes(manifest: Manifest) -> list[DeviceNode]:
     }.values())
 
 
-_MAX_STAGE_34_ATTEMPTS = 5
+_MAX_STAGE_ATTEMPTS = 5
 
 
 def _query_stage_34_nodes(manifest: Manifest) -> list[DeviceNode]:
@@ -734,7 +751,7 @@ def _query_stage_34_nodes(manifest: Manifest) -> list[DeviceNode]:
         if n.stage_download_pdf == STAGE_COMPLETED
         and n.stage_index_rag not in (STAGE_COMPLETED, 1)
         and not (n.queue == QUEUE_4_MANUAL_REVIEW and not n.failure_retryable)
-        and (n.failure_attempts or 0) < _MAX_STAGE_34_ATTEMPTS
+        and (n.failure_attempts or 0) < _MAX_STAGE_ATTEMPTS
     }.values())
 
 
@@ -746,6 +763,8 @@ async def run_pipeline(
     """Drive the full pipeline for devices listed in *devices_path*."""
     manifest_db = manifest_db or settings.manifests_db
     manifest = Manifest(manifest_db)
+    from . import call_budget
+    call_budget.reset_all()
     ragscallion_client = RagscallionClient(base_url=settings.ragscallion_base_url())
 
     # Load/create nodes
