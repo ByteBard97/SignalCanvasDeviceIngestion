@@ -93,6 +93,45 @@ async def test_scope_check_bypasses_already_completed_devices(test_manifest):
 
 
 @pytest.mark.asyncio
+async def test_scope_check_budget_exhaustion_fails_device_not_run(test_manifest, monkeypatch):
+    """If the per-device LLM budget is exhausted at scope-check classification,
+    the device must be failed gracefully (not crash the whole run).
+
+    This guards runner.py's classify call site, which is NOT inside the broad
+    try/except that the Stage 6-7 classify call sits in — an unhandled
+    CallBudgetExceeded there would abort the entire `for node in nodes` loop.
+    """
+    import src.runner as runner
+    from src.call_budget import CallBudgetExceeded
+
+    # Force the LLM path (no EasySchematic AV-type bypass) and make the
+    # classifier report the device is over its call budget.
+    monkeypatch.setattr(runner, "get_combined_context", lambda *a, **k: None)
+
+    async def _budget_exhausted(*args, **kwargs):
+        raise CallBudgetExceeded("device over LLM budget")
+
+    monkeypatch.setattr(runner, "classify", _budget_exhausted)
+
+    node = DeviceNode(
+        device_id="acme-over-budget",
+        manufacturer="Acme",
+        model="WidgetMatrix",
+        corpus_id="acme-over-budget",
+        queue=QUEUE_0_INITIAL,
+    )
+    test_manifest.add_node(node)
+
+    # Must return normally — the run is not aborted.
+    result = await _run_scope_check([node], test_manifest)
+
+    assert result == []  # device skipped, not kept
+    reloaded = test_manifest.get_node("acme-over-budget")
+    assert reloaded.queue == QUEUE_4_MANUAL_REVIEW
+    assert reloaded.failure_attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_scope_check_mixed_batch(test_manifest):
     """A batch with AV + networking + already-completed must split correctly."""
     av_node = DeviceNode(
