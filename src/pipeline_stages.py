@@ -479,6 +479,7 @@ async def _attempt_name_correction(
             work_dir=repo_root,
             timeout=60,
             max_steps=5,
+            device_id=node.device_id,
         )
     except Exception as e:
         logger.warning(f"Device {node.device_id} name correction Kimi failed: {e}")
@@ -645,6 +646,7 @@ async def stage_0_resolve_sku(
                     work_dir=repo_root,
                     timeout=RESOLVE_SKU_TIMEOUT_SECONDS * (attempt + 1),
                     max_steps=RESOLVE_SKU_MAX_STEPS,
+                    device_id=node.device_id,
                 )
                 if stdout:
                     break
@@ -808,6 +810,7 @@ async def _find_spec_sheet_url(
                     work_dir=repo_root,
                     timeout=FIND_PDF_TIMEOUT_SECONDS,
                     max_steps=FIND_PDF_MAX_STEPS,
+                    device_id=node.device_id,
                 )
             except Exception as e:
                 logger.error(f"Device {node.device_id} Kimi invocation failed (attempt {attempt}): {e}")
@@ -1015,6 +1018,7 @@ async def stage_1b_find_html_source(
                     work_dir=repo_root,
                     timeout=FIND_HTML_TIMEOUT_SECONDS,
                     max_steps=FIND_PDF_MAX_STEPS,
+                    device_id=node.device_id,
                 )
             except Exception as e:
                 logger.error(f"Device {node.device_id} HTML search Kimi failed (attempt {attempt}): {e}")
@@ -1145,6 +1149,7 @@ async def _find_secondary_doc(
                 work_dir=repo_root,
                 timeout=FIND_PDF_TIMEOUT_SECONDS,
                 max_steps=FIND_PDF_MAX_STEPS,
+                device_id=node.device_id,
             )
         except Exception as e:
             logger.warning(f"Device {node.device_id}: {doc_type} Kimi failed: {e}")
@@ -1463,6 +1468,7 @@ async def stage_2_download_pdf(
                             failed_url=current_url,
                             error_summary=last_error,
                             tried_urls=tried_urls,
+                            device_id=node.device_id,
                         )
                         if alt_url:
                             current_url = alt_url
@@ -1503,6 +1509,7 @@ async def stage_2_download_pdf(
                         failed_url=current_url,
                         error_summary=last_error,
                         tried_urls=tried_urls,
+                        device_id=node.device_id,
                     )
                     if alt_url:
                         current_url = alt_url
@@ -1583,6 +1590,7 @@ async def stage_2_download_pdf(
                         failed_url=current_url,
                         error_summary=last_error,
                         tried_urls=tried_urls,
+                        device_id=node.device_id,
                     )
                     if alt_url:
                         current_url = alt_url
@@ -1647,6 +1655,7 @@ async def _request_alternate_pdf_url(
     failed_url: str,
     error_summary: str,
     tried_urls: list[str],
+    device_id: str | None = None,
 ) -> Optional[str]:
     """Ask Kimi for an alternate PDF URL after a download-time connection failure.
 
@@ -1678,6 +1687,7 @@ async def _request_alternate_pdf_url(
                 work_dir=repo_root,
                 timeout=FALLBACK_URL_TIMEOUT_SECONDS,
                 max_steps=FALLBACK_URL_MAX_STEPS,
+                device_id=device_id,
             )
         except Exception as e:
             logger.error(f"Stage 2 fallback Kimi invocation failed (attempt {kimi_attempt}): {e}")
@@ -2174,6 +2184,7 @@ async def _extract_specs_via_agent(
         device_class=device_class,
         has_critique=bool(critique_concerns),
         timeout=EXTRACTION_TIMEOUT_SECONDS,
+        device_id=device_id,
     )
     if stdout is None:
         logger.warning(f"Extraction for {manufacturer} {model}: Kimi returned no output")
